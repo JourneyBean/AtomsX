@@ -1,0 +1,86 @@
+# Docker Compose Production Override
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# This file adds production-specific configurations:
+# - Production Dockerfile references
+# - Resource limits
+# - Restart policies
+# - NO additional port exposures (Gateway 80/443 only from base)
+
+services:
+  # PostgreSQL - no port exposure in production
+  postgres:
+    restart: always
+
+  # Redis - no port exposure in production
+  redis:
+    restart: always
+
+  # Docker-in-Docker - required for production isolation
+  dind:
+    restart: always
+
+  # Django Backend - production build
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+        no_proxy: ${NO_PROXY:-}
+    environment:
+      DJANGO_DEBUG: "False"
+      # DJANGO_SECRET_KEY must be set in production (no default)
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?DJANGO_SECRET_KEY is required in production}
+    restart: always
+    # Remove source code volume mount in production
+    volumes:
+      - dind_socket:/var/run/dind:ro
+    command: ["uv", "run", "gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3", "--threads", "2"]
+
+  # Celery Worker - production build
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+        no_proxy: ${NO_PROXY:-}
+    environment:
+      DJANGO_DEBUG: "False"
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?DJANGO_SECRET_KEY is required in production}
+    restart: always
+    # Remove source code volume mount in production
+    volumes:
+      - dind_socket:/var/run/dind:ro
+    command: ["uv", "run", "celery", "-A", "config.celery", "worker", "--loglevel=warning"]
+
+  # Vue Frontend - production build with nginx
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+        no_proxy: ${NO_PROXY:-}
+        VITE_API_URL: /api
+    restart: always
+    # Remove volume mounts in production
+    volumes: []
+    command: []
+
+  # Gateway
+  gateway:
+    restart: always

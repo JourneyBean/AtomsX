@@ -1,0 +1,223 @@
+# AtomsX Docker Compose Configuration
+# Base configuration - use with docker-compose.dev.yml or docker-compose.prod.yml
+#
+# Usage:
+#   Development: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#   Production:  docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Note: Authentik (OIDC Provider) is included in docker-compose.dev.yml
+#       with dedicated PostgreSQL and persistent data in .dev-cache/
+#       Production should use external OIDC provider (e.g., Auth0, Okta, enterprise SSO).
+
+services:
+  # ===========================================================================
+  # PostgreSQL Database
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-atomsx}
+      POSTGRES_USER: ${POSTGRES_USER:-atomsx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-atomsx_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-atomsx}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # Redis
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # Docker-in-Docker (for production isolation)
+  # In development, this is disabled (replicas: 0 in dev override)
+  # ===========================================================================
+  dind:
+    image: docker:dind
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - dind_data:/var/lib/docker
+      - dind_socket:/var/run
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    command: ["--storage-driver=vfs"]
+
+  # ===========================================================================
+  # Django Backend
+  # ===========================================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+        no_proxy: ${NO_PROXY:-}
+    environment:
+      # Django
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-secret-key}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-True}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,backend}
+      # PostgreSQL (using centralized vars)
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-atomsx}
+      POSTGRES_USER: ${POSTGRES_USER:-atomsx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-atomsx_password}
+      # Redis (using centralized vars)
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      # OIDC
+      OIDC_PROVIDER_URL: ${OIDC_PROVIDER_URL:-http://authentik-server:9000/application/o/atomsx/}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-atomsx}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-change-me}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-http://localhost/api/auth/callback}
+      # CORS
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      # Docker/Workspace
+      DIND_ENABLED: ${DIND_ENABLED:-true}
+      DIND_SOCKET_PATH: ${DIND_SOCKET_PATH:-/var/run/dind/docker.sock}
+      DOCKER_HOST: ${DOCKER_HOST:-unix:///var/run/dind/docker.sock}
+      WORKSPACE_NETWORK_NAME: ${WORKSPACE_NETWORK_NAME:-atomsx-workspaces}
+      WORKSPACE_BASE_IMAGE: ${WORKSPACE_BASE_IMAGE:-atomsx-workspace:latest}
+    volumes:
+      - ./backend:/app
+      - dind_socket:/var/run/dind:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      dind:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Celery Worker
+  # ===========================================================================
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+        no_proxy: ${NO_PROXY:-}
+    environment:
+      # Django
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-secret-key}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-True}
+      # PostgreSQL (using centralized vars)
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-atomsx}
+      POSTGRES_USER: ${POSTGRES_USER:-atomsx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-atomsx_password}
+      # Redis (using centralized vars)
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      # Docker/Workspace
+      DIND_ENABLED: ${DIND_ENABLED:-true}
+      DIND_SOCKET_PATH: ${DIND_SOCKET_PATH:-/var/run/dind/docker.sock}
+      DOCKER_HOST: ${DOCKER_HOST:-unix:///var/run/dind/docker.sock}
+      WORKSPACE_NETWORK_NAME: ${WORKSPACE_NETWORK_NAME:-atomsx-workspaces}
+      WORKSPACE_BASE_IMAGE: ${WORKSPACE_BASE_IMAGE:-atomsx-workspace:latest}
+    volumes:
+      - ./backend:/app
+      - dind_socket:/var/run/dind:ro
+    depends_on:
+      dind:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    command: uv run celery -A config.celery worker --loglevel=info
+
+  # ===========================================================================
+  # Vue Frontend (Development)
+  # ===========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+        no_proxy: ${NO_PROXY:-}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      VITE_API_URL: /api
+    depends_on:
+      backend:
+        condition: service_started
+    command: npm run dev -- --host
+
+  # ===========================================================================
+  # OpenResty Gateway
+  # ===========================================================================
+  gateway:
+    image: openresty/openresty:alpine
+    volumes:
+      - ./gateway/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./gateway/lua:/usr/local/openresty/lua:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+  redis_data:
+  dind_data:
+  dind_socket:
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  default:
+    name: atomsx-network

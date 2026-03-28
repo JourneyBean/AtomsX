@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atomsx-backend"
+version = "0.1.0"
+description = "AtomsX Visual Coding Platform - Backend"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"  # Python 3.13 not supported by psycopg2-binary yet
+license = {text = "MIT"}
+authors = [
+    {name = "AtomsX Team"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: Django",
+    "Framework :: Django :: 5.2",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    # Django and DRF
+    "django==5.2",
+    "djangorestframework==3.15",
+    "django-cors-headers==4.4",
+    # Database
+    "psycopg2-binary>=2.9.9",
+    # Redis and Celery
+    "redis==5.0",
+    "celery==5.4",
+    # OIDC
+    "requests>=2.32.3",
+    "pyjwt>=2.9",
+    # Docker SDK
+    "docker==7.1",
+    # Utilities
+    "python-dotenv==1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3",
+    "pytest-django==4.9",
+    "pytest-cov==5.0",
+]
+
+[project.scripts]
+atomsx-manage = "manage:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["apps*", "config*"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+python_files = ["test_*.py", "*_tests.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["apps"]
+omit = ["*/migrations/*", "*/tests.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+]
+
+# uv configuration - use dependency-groups for development dependencies
+[dependency-groups]
+dev = [
+    "pytest==8.3",
+    "pytest-django==4.9",
+    "pytest-cov==5.0",
+]
+
+# Ruff configuration (placeholder for future linting)
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]  # Line too long (handled by formatter)

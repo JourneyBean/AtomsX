@@ -1,0 +1,161 @@
+# Docker Compose Development Override
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# This file adds development-specific configurations:
+# - Debug port exposures (backend, frontend, postgres, redis)
+# - Use host Docker socket instead of dind (simpler for development)
+# - Authentik OIDC Provider with persistent data in .dev-cache/
+# - Authentik uses dedicated PostgreSQL instance (isolated from main app)
+
+services:
+  # ===========================================================================
+  # Main App PostgreSQL - port exposure for debugging
+  # ===========================================================================
+  postgres:
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"  # Exposed for dev debugging tools
+
+  redis:
+    ports:
+      - "${REDIS_PORT:-6379}:6379"  # Exposed for dev debugging tools
+
+  # ===========================================================================
+  # Django Backend - dev overrides
+  # ===========================================================================
+  backend:
+    ports:
+      - "8000:8000"  # Direct backend API access for debugging
+    environment:
+      DJANGO_DEBUG: "True"
+      # Use host Docker socket in development (no dind isolation needed)
+      DOCKER_HOST: unix:///var/run/docker.sock
+      DIND_ENABLED: "false"
+      # OIDC points to Authentik (dev only)
+      OIDC_PROVIDER_URL: ${OIDC_PROVIDER_URL:-http://authentik-server:9000/application/o/atomsx/}
+    volumes:
+      - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock  # Mount host Docker socket
+    # Override: don't depend on dind in dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery-worker:
+    environment:
+      DJANGO_DEBUG: "True"
+      # Use host Docker socket in development
+      DOCKER_HOST: unix:///var/run/docker.sock
+      DIND_ENABLED: "false"
+    volumes:
+      - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock  # Mount host Docker socket
+    # Override: don't depend on dind in dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Vue Frontend - dev overrides
+  # ===========================================================================
+  frontend:
+    ports:
+      - "5173:5173"  # Direct frontend access for debugging
+    # Override entrypoint to use the mounted script (handles npm install)
+    entrypoint: ["/app/docker-entrypoint.dev.sh"]
+    # Volume mounts and HMR command inherited from base
+
+  # ===========================================================================
+  # Gateway - dev port override
+  # ===========================================================================
+  gateway:
+    ports:
+      - "18080:80"  # Use 18080 to avoid conflict with authentik on 80
+
+  # ===========================================================================
+  # Disable dind in development - we use host Docker socket directly
+  # ===========================================================================
+  dind:
+    deploy:
+      replicas: 0  # Don't run dind in development
+
+  # ===========================================================================
+  # Authentik OIDC Provider (Development Only)
+  # Uses dedicated PostgreSQL with data persisted in .dev-cache/
+  # Data persists across main app resets for convenience.
+  # ===========================================================================
+  authentik-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${AUTHENTIK_POSTGRESQL_NAME:-atomsx_authentik}
+      POSTGRES_USER: ${POSTGRES_USER:-atomsx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-atomsx_password}
+    volumes:
+      - .dev-cache/docker/authentik/db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-atomsx} -d ${AUTHENTIK_POSTGRESQL_NAME:-atomsx_authentik}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2026.2.1
+    shm_size: 512mb
+    command: server
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:-change-me-to-at-least-50-characters}
+      # Bootstrap configuration (only read on first startup)
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:-}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN:-}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL:-}
+      # Redis (connect to main app's Redis)
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_REDIS__PORT: ${REDIS_PORT:-6379}
+      # PostgreSQL (dedicated instance)
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${POSTGRES_USER:-atomsx}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${POSTGRES_PASSWORD:-atomsx_password}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL_NAME:-atomsx_authentik}
+    volumes:
+      - .dev-cache/docker/authentik/media:/media
+      - .dev-cache/docker/authentik/templates:/templates
+    ports:
+      - "9000:9000"
+      - "9443:9443"
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2026.2.1
+    shm_size: 512mb
+    user: root
+    command: worker
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:-change-me-to-at-least-50-characters}
+      # Bootstrap configuration (only read on first startup)
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:-}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN:-}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL:-}
+      # Redis (connect to main app's Redis)
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_REDIS__PORT: ${REDIS_PORT:-6379}
+      # PostgreSQL (dedicated instance)
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${POSTGRES_USER:-atomsx}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${POSTGRES_PASSWORD:-atomsx_password}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL_NAME:-atomsx_authentik}
+    volumes:
+      - .dev-cache/docker/authentik/media:/media
+      - .dev-cache/docker/authentik/templates:/templates
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
