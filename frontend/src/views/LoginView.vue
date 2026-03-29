@@ -26,38 +26,40 @@ function handleLogin() {
   justify-content: center;
   align-items: center;
   height: 100vh;
-  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+  background: linear-gradient(135deg, #f5f5f7 0%, #e8e8ed 100%);
 }
 
 .login-card {
-  background: rgba(255, 255, 255, 0.1);
+  background: #fff;
   border-radius: 16px;
   padding: 48px;
   text-align: center;
-  backdrop-filter: blur(10px);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
 }
 
 .login-card h1 {
-  color: #fff;
+  color: #1d1d1f;
   font-size: 2.5rem;
+  font-weight: 600;
   margin-bottom: 8px;
 }
 
 .login-card p {
-  color: rgba(255, 255, 255, 0.7);
+  color: #86868b;
   margin-bottom: 32px;
+  font-size: 1.1rem;
 }
 
 .login-btn {
   background: #4f46e5;
   color: white;
-  padding: 12px 32px;
-  border-radius: 8px;
+  padding: 14px 32px;
+  border-radius: 10px;
   font-size: 1rem;
   cursor: pointer;
   border: none;
-  transition: background 0.2s;
+  transition: background 0.15s;
+  font-weight: 500;
 }
 
 .login-btn:hover {

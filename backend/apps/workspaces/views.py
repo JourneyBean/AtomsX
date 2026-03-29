@@ -26,7 +26,8 @@ from django.conf import settings
 
 from .models import Workspace
 from .serializers import WorkspaceSerializer, CreateWorkspaceSerializer
-from .tasks import create_workspace_container, delete_workspace_container
+from .tasks import create_workspace_container, delete_workspace_container, recreate_workspace_container
+from .preview_token import generate_preview_token
 from apps.core.models import create_audit_log
 
 logger = logging.getLogger(__name__)
@@ -187,6 +188,119 @@ class WorkspaceDetailView(APIView):
         logger.info(f'Deleting workspace {workspace_id}')
 
         return Response(status=status.HTTP_202_ACCEPTED)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class WorkspaceRecreateView(APIView):
+    """
+    API view for recreating a workspace with the latest image.
+
+    POST /api/workspaces/:id/recreate/
+
+    Recreates the workspace container while preserving data directory.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, workspace_id):
+        """
+        Recreate workspace container with latest image.
+        """
+        workspace = get_object_or_404(Workspace, id=workspace_id)
+
+        # Check ownership
+        if workspace.owner != request.user:
+            return Response(
+                {'error': 'Access denied'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Check if workspace is in a state that allows recreate
+        if workspace.status == 'deleting':
+            return Response(
+                {'error': 'Cannot recreate workspace in deleting state'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Check if recreate is already in progress
+        if workspace.status == 'recreating':
+            return Response(
+                {'error': 'Workspace recreate already in progress'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # Update status to recreating
+        previous_status = workspace.status
+        workspace.transition_status('recreating')
+        workspace.save()
+
+        # Audit log
+        create_audit_log(
+            event_type='WORKSPACE_STATUS_CHANGE',
+            user_id=request.user.id,
+            workspace_id=workspace.id,
+            previous_status=previous_status,
+            new_status='recreating',
+        )
+
+        # Trigger async container recreation
+        recreate_workspace_container.delay(str(workspace.id))
+
+        logger.info(f'Recreating workspace {workspace_id}')
+
+        return Response(
+            WorkspaceSerializer(workspace).data,
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class PreviewTokenView(APIView):
+    """
+    API view for generating preview access tokens.
+
+    POST /api/workspaces/:id/preview-token/
+
+    Generates a time-limited token for preview URL access.
+    Used by frontend to construct iframe URLs with token parameter.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, workspace_id):
+        """
+        Generate a preview token for a workspace.
+
+        Returns:
+            - token: UUID token string
+            - expires_at: ISO timestamp when token expires
+            - workspace_id: UUID of the workspace
+        """
+        workspace = get_object_or_404(Workspace, id=workspace_id)
+
+        # Check ownership
+        if workspace.owner != request.user:
+            return Response(
+                {'error': 'Access denied'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Generate token
+        token_data = generate_preview_token(
+            user_id=str(request.user.id),
+            workspace_id=str(workspace.id),
+        )
+
+        # Audit log
+        create_audit_log(
+            event_type='PREVIEW_TOKEN_GENERATED',
+            user_id=request.user.id,
+            workspace_id=workspace.id,
+        )
+
+        logger.info(f'Generated preview token for workspace {workspace_id} by user {request.user.id}')
+
+        return Response(token_data)
 
 
 @method_decorator(csrf_exempt, name='dispatch')

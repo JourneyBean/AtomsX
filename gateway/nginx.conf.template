@@ -1,5 +1,5 @@
 worker_processes auto;
-error_log /usr/local/openresty/nginx/logs/error.log warn;
+error_log /usr/local/openresty/nginx/logs/error.log info;
 pid /var/run/nginx.pid;
 
 events {
@@ -44,9 +44,16 @@ http {
     # Main server block
     server {
         listen 80;
+        listen 443 ssl;
         # Use catch-all instead of hardcoded localhost
         # In production, this will be overridden by actual domain
         server_name _;
+
+        # Snakeoil SSL certificate configuration
+        ssl_certificate /etc/nginx/ssl/snakeoil.crt;
+        ssl_certificate_key /etc/nginx/ssl/snakeoil.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
 
         # API requests go to Django backend (HTTP + WebSocket)
         location /api/ {
@@ -91,7 +98,14 @@ http {
     # (Host header excludes port for standard ports 80/443)
     server {
         listen 80;
+        listen 443 ssl;
         server_name ~^(?<workspace_id>[a-f0-9\-]+)\.${ATOMSX_PREVIEW_DOMAIN}$;
+
+        # Snakeoil SSL certificate configuration
+        ssl_certificate /etc/nginx/ssl/snakeoil.crt;
+        ssl_certificate_key /etc/nginx/ssl/snakeoil.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
 
         # Docker internal DNS resolver for Lua HTTP requests
         # Docker embedded DNS server runs at 127.0.0.11:53
@@ -104,28 +118,20 @@ http {
         # Pre-declare container_host for Lua to set dynamically
         set $container_host "";
 
-        # Handle OPTIONS preflight requests - return CORS headers without auth check
-        if ($request_method = 'OPTIONS') {
-            add_header 'Access-Control-Allow-Origin' '*' always;
-            add_header 'Access-Control-Allow-Methods' 'GET, HEAD, OPTIONS' always;
-            add_header 'Access-Control-Allow-Headers' '*' always;
-            add_header 'Access-Control-Max-Age' 86400 always;
-            add_header 'Content-Length' 0;
-            return 204;
-        }
-
-        # Add CORS headers to all responses using Lua header_filter
-        # This is more reliable than nginx add_header in location blocks
-        header_filter_by_lua_block {
-            ngx.header['Access-Control-Allow-Origin'] = '*'
-            ngx.header['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
-            ngx.header['Access-Control-Allow-Headers'] = '*'
-        }
-
-        # Authentication check via Lua
+        # Handle OPTIONS preflight requests and set container_host
         access_by_lua_block {
-            local auth = require "auth_check"
-            auth.check(ngx.var.workspace_id)
+            -- Handle OPTIONS preflight requests
+            if ngx.req.get_method() == "OPTIONS" then
+                ngx.header['Access-Control-Allow-Origin'] = '*'
+                ngx.header['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
+                ngx.header['Access-Control-Allow-Headers'] = '*'
+                ngx.header['Access-Control-Max-Age'] = '86400'
+                ngx.header['Content-Length'] = 0
+                ngx.exit(204)
+            end
+
+            -- Set container_host directly (no auth check for preview)
+            ngx.var.container_host = "workspace-" .. ngx.var.workspace_id .. ":3000"
         }
 
         # Proxy to workspace container
@@ -147,22 +153,8 @@ http {
             proxy_cache off;
             proxy_read_timeout 86400s;
 
-            # Error handling
-            proxy_intercept_errors on;
-            error_page 502 503 504 = @workspace_error;
-        }
-
-        # Error handling for workspace not available
-        location @workspace_error {
-            content_by_lua_block {
-                ngx.header['Access-Control-Allow-Origin'] = '*'
-                ngx.header['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
-                ngx.header['Access-Control-Allow-Headers'] = '*'
-                ngx.header['Content-Type'] = 'text/html'
-                ngx.status = 503
-                ngx.say('<html><body><h1>Workspace Unavailable</h1><p>The workspace is not currently running. Please try again later.</p></body></html>')
-                ngx.exit(503)
-            }
+            # Pass through workspace errors as-is (don't intercept 502/503/504)
+            # proxy_intercept_errors off;  # default is off, explicit for clarity
         }
     }
 
@@ -170,7 +162,14 @@ http {
     # Note: server_name matches HTTP Host header which does NOT include port
     server {
         listen 80;
+        listen 443 ssl;
         server_name ~^(?<workspace_id>[a-f0-9\-]+)\.${ATOMSX_DEPLOY_DOMAIN}$;
+
+        # Snakeoil SSL certificate configuration
+        ssl_certificate /etc/nginx/ssl/snakeoil.crt;
+        ssl_certificate_key /etc/nginx/ssl/snakeoil.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
 
         # Docker internal DNS resolver for Lua HTTP requests
         resolver 127.0.0.11 valid=30s ipv6=off;
@@ -207,15 +206,8 @@ http {
             proxy_cache off;
             proxy_read_timeout 86400s;
 
-            # Error handling
-            proxy_intercept_errors on;
-            error_page 502 503 504 = @workspace_error;
-        }
-
-        # Error handling for workspace not available
-        location @workspace_error {
-            default_type text/html;
-            return 503 '<html><body><h1>Workspace Unavailable</h1><p>The workspace is not currently running. Please try again later.</p></body></html>';
+            # Pass through workspace errors as-is (don't intercept 502/503/504)
+            # proxy_intercept_errors off;  # default is off, explicit for clarity
         }
     }
 }

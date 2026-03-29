@@ -1,5 +1,6 @@
 -- Authentication and routing module for Preview access
 -- Handles: auth verification, workspace ownership, container resolution
+-- Supports: session cookie OR preview token query parameter
 
 local http = require "resty.http"
 local cjson = require "cjson"
@@ -8,7 +9,7 @@ local cache = ngx.shared.workspace_cache
 local M = {}
 
 -- Configuration
-local AUTH_VERIFY_URL = "http://backend:8000/api/auth/verify"
+local AUTH_VERIFY_URL = "http://backend:8000/api/auth/verify/"
 local CACHE_TTL = 60  -- Cache auth results for 60 seconds
 
 --- Check authentication and workspace access
@@ -21,15 +22,33 @@ function M.check(workspace_id)
         return
     end
 
-    -- Check if we have a cached result for this session + workspace
-    local session_id = ngx.var.cookie_sessionid or ngx.var.http_authorization or "anonymous"
-    local cache_key = session_id .. ":" .. workspace_id
+    -- Extract token from query parameter or cookie
+    local token = ngx.var.arg_token
 
+    -- If no token in query, check cookie
+    if not token then
+        local cookie_header = ngx.var.http_cookie or ""
+        -- Parse preview_token cookie
+        token = ngx.re.match(cookie_header, "preview_token=([^;]+)")
+        if token then
+            token = token[1]
+        end
+    end
+
+    -- Build cache key: prefer token, fall back to session
+    local cache_key
+    if token then
+        cache_key = "token:" .. token .. ":" .. workspace_id
+    else
+        local session_id = ngx.var.cookie_sessionid or ngx.var.http_authorization or "anonymous"
+        cache_key = "session:" .. session_id .. ":" .. workspace_id
+    end
+
+    -- Check cache
     local cached = cache:get(cache_key)
     if cached then
         local result = cjson.decode(cached)
         if result.authorized then
-            -- Set container host and continue
             ngx.var.container_host = result.container_host
             ngx.log(ngx.INFO, "Using cached auth for workspace ", workspace_id)
             return
@@ -39,9 +58,15 @@ function M.check(workspace_id)
         end
     end
 
+    -- Build backend URL with token parameter if present
+    local verify_url = AUTH_VERIFY_URL .. "?workspace_id=" .. workspace_id
+    if token then
+        verify_url = verify_url .. "&token=" .. token
+    end
+
     -- Verify with backend
     local httpc = http.new()
-    local res, err = httpc:request_uri(AUTH_VERIFY_URL, {
+    local res, err = httpc:request_uri(verify_url, {
         method = "GET",
         headers = {
             ["Cookie"] = ngx.var.http_cookie or "",
@@ -65,16 +90,11 @@ function M.check(workspace_id)
         -- Cache the result
         local cache_value = cjson.encode({
             authorized = true,
-            -- Fallback container_host - should never be used as backend returns proper host
-            -- If used, this would resolve to localhost within Gateway container (incorrect)
-            -- TODO: Replace with proper workspace container naming convention
             container_host = body.container_host or "localhost:3000",
         })
         cache:set(cache_key, cache_value, CACHE_TTL)
 
         -- Set the container host for proxy_pass
-        -- For MVP, we construct the container host from the workspace_id
-        -- In production, this would come from the backend response
         ngx.var.container_host = body.container_host or M._get_container_host(workspace_id)
 
         ngx.log(ngx.INFO, "Preview access granted for user ", body.user_id or "unknown",

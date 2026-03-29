@@ -27,6 +27,7 @@ class Workspace(models.Model):
         ('running', 'Running'),
         ('stopped', 'Stopped'),
         ('error', 'Error'),
+        ('recreating', 'Recreating'),
         ('deleting', 'Deleting'),
     ]
 
@@ -51,7 +52,7 @@ class Workspace(models.Model):
         max_length=255,
         null=True,
         blank=True,
-        help_text='Host:port for the container preview server',
+        help_text='Docker DNS hostname for preview server (format: workspace-{uuid}:3000)',
     )
     status = models.CharField(
         max_length=20,
@@ -112,9 +113,10 @@ class Workspace(models.Model):
         """
         valid_transitions = {
             'creating': ['running', 'error'],
-            'running': ['stopped', 'error', 'deleting'],
-            'stopped': ['running', 'deleting'],
-            'error': ['creating', 'deleting'],
+            'running': ['stopped', 'error', 'deleting', 'recreating'],
+            'stopped': ['running', 'deleting', 'recreating'],
+            'error': ['creating', 'deleting', 'recreating'],
+            'recreating': ['running', 'error'],
             'deleting': [],  # Terminal state
         }
 

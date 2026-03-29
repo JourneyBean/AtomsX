@@ -6,6 +6,7 @@ import { onFileOperation, offFileOperation } from '@/stores/session'
 import { useNotificationStore } from '@/stores/notification'
 import CodeView from '@/components/CodeView.vue'
 import type { Workspace, HistorySession } from '@/types'
+import { marked } from 'marked'
 
 const route = useRoute()
 const router = useRouter()
@@ -24,6 +25,9 @@ const activeTab = ref<'preview' | 'code'>('code')
 const previewReady = ref<boolean | null>(null) // null = not checked yet
 const previewError = ref<string>('')
 const checkingPreview = ref(false)
+const previewToken = ref<string>('')
+const previewTokenExpiry = ref<Date | null>(null)
+const previewDomain = ref<string>('') // For cookie domain
 
 // History state
 const historySessions = ref<HistorySession[]>([])
@@ -32,6 +36,7 @@ const historyError = ref<string>('')
 const isOffline = ref(false)
 const isComposing = ref(false) // IME composition state
 const currentHistorySessionId = ref<string | undefined>() // Track resumed session for sending new messages
+const textareaRef = ref<HTMLTextAreaElement | null>(null)
 
 // File tree refresh trigger
 const fileRefreshTrigger = ref(0)
@@ -80,13 +85,24 @@ function handleMouseUp() {
 const previewUrl = computed(() => {
   const baseUrl = workspace.value?.preview_url || ''
   if (!baseUrl) return ''
+
+  // Build URL - authentication is handled via cookie set in generatePreviewToken()
+  // Cookie is set on .preview.localhost domain, so iframe can access it
+  let url = baseUrl
+
+  // Upgrade HTTP to HTTPS if main page is HTTPS (avoid mixed-content blocking)
+  if (window.location.protocol === 'https:' && url.startsWith('http://')) {
+    url = url.replace('http://', 'https://')
+  }
+
   // Append current page's port if not standard (80/443)
   const port = window.location.port
   if (port && port !== '80' && port !== '443') {
     // Insert port before the path (baseUrl is like http://xxx.preview.localhost)
-    return baseUrl.replace(/^http(s?):\/\/([^\/]+)(\/.*)?$/, `http$1://$2:${port}$3`)
+    url = url.replace(/^http(s?):\/\/([^\/]+)(\/.*)?$/, `http$1://$2:${port}$3`)
   }
-  return baseUrl
+
+  return url
 })
 
 // Computed status display
@@ -120,6 +136,40 @@ onUnmounted(() => {
   window.removeEventListener('mouseup', handleMouseUp)
 })
 
+async function generatePreviewToken(): Promise<boolean> {
+  if (!workspaceId) return false
+
+  try {
+    const response = await fetch(`/api/workspaces/${workspaceId}/preview-token/`, {
+      method: 'POST',
+      credentials: 'include',
+    })
+
+    if (response.ok) {
+      const data = await response.json()
+      previewToken.value = data.token
+      previewTokenExpiry.value = new Date(data.expires_at)
+      previewDomain.value = data.preview_domain || 'preview.localhost'
+
+      // Set cookie for preview subdomain sharing
+      // Domain: .preview.localhost allows workspace-id.preview.localhost to access
+      const maxAge = Math.floor((data.expires_at_unix || 600))
+      document.cookie = `preview_token=${data.token}; Path=/; Domain=.${previewDomain.value}; Max-Age=${maxAge}; SameSite=Lax`
+
+      return true
+    } else if (response.status === 403) {
+      previewError.value = 'Access denied to this workspace'
+      return false
+    } else {
+      previewError.value = 'Failed to generate preview token'
+      return false
+    }
+  } catch {
+    previewError.value = 'Failed to generate preview token'
+    return false
+  }
+}
+
 async function checkPreviewAvailability() {
   if (!previewUrl.value) {
     previewReady.value = false
@@ -128,6 +178,14 @@ async function checkPreviewAvailability() {
   }
 
   checkingPreview.value = true
+
+  // Generate a preview token first
+  const tokenGenerated = await generatePreviewToken()
+  if (!tokenGenerated) {
+    previewReady.value = false
+    checkingPreview.value = false
+    return
+  }
 
   // Try normal fetch - if CORS allows, we can read the status code
   try {
@@ -179,6 +237,11 @@ async function sendMessage() {
   const content = newMessage.value
   newMessage.value = ''
 
+  // Reset textarea height after clearing
+  if (textareaRef.value) {
+    textareaRef.value.style.height = 'auto'
+  }
+
   // Check if we're in a resumed session
   if (currentHistorySessionId.value) {
     // Save current history messages before starting session
@@ -226,6 +289,7 @@ function switchTab(tab: 'preview' | 'code') {
 function retryPreview() {
   previewReady.value = null
   previewError.value = ''
+  previewToken.value = '' // Clear old token
   checkPreviewAvailability()
 }
 
@@ -306,7 +370,14 @@ async function resumeHistory(historySession: HistorySession) {
 function formatRelativeTime(timestamp: string): string {
   if (!timestamp) return ''
 
-  const date = new Date(timestamp)
+  // Backend returns UTC time without 'Z' suffix, need to append it
+  // so JS parses it as UTC instead of local time (8 hour difference for CN)
+  let normalizedTimestamp = timestamp
+  if (!timestamp.endsWith('Z') && !timestamp.includes('+') && !/-\d{2}:\d{2}$/.test(timestamp)) {
+    normalizedTimestamp = timestamp + 'Z'
+  }
+
+  const date = new Date(normalizedTimestamp)
   const now = new Date()
   const diffMs = now.getTime() - date.getTime()
   const diffMins = Math.floor(diffMs / 60000)
@@ -323,8 +394,33 @@ function formatRelativeTime(timestamp: string): string {
 
 function handleKeyDown(event: KeyboardEvent) {
   if (event.key === 'Enter' && !isComposing.value) {
-    sendMessage()
+    // Send message on Enter, allow Shift+Enter for new line
+    if (!event.shiftKey) {
+      event.preventDefault()
+      sendMessage()
+    }
   }
+}
+
+function adjustTextareaHeight() {
+  const textarea = textareaRef.value
+  if (!textarea) return
+
+  // Reset height to auto to get the correct scrollHeight
+  textarea.style.height = 'auto'
+
+  // Calculate line height (approximate, using 20px as base)
+  const lineHeight = 20
+  const maxHeight = lineHeight * 6 + 24 // 6 lines + padding
+
+  // Set height based on content, capped at max height
+  const newHeight = Math.min(textarea.scrollHeight, maxHeight)
+  textarea.style.height = newHeight + 'px'
+}
+
+function renderMarkdown(content: string): string {
+  if (!content) return ''
+  return marked.parse(content, { breaks: true }) as string
 }
 </script>
 
@@ -387,7 +483,8 @@ function handleKeyDown(event: KeyboardEvent) {
                 <span class="role">{{ msg.role === 'user' ? 'You' : 'Agent' }}</span>
                 <span class="status" v-if="msg.status !== 'complete'">{{ msg.status }}</span>
               </div>
-              <div class="message-content">{{ msg.content }}</div>
+              <div class="message-content" v-if="msg.role === 'user'">{{ msg.content }}</div>
+              <div class="message-content markdown-body" v-else v-html="renderMarkdown(msg.content)"></div>
             </div>
 
             <div v-if="sessionStore.messages.length === 0" class="empty-messages">
@@ -396,13 +493,16 @@ function handleKeyDown(event: KeyboardEvent) {
           </div>
 
           <div class="input-section">
-            <input
+            <textarea
               v-model="newMessage"
               placeholder="Type a message..."
               class="message-input"
+              rows="1"
               @keydown="handleKeyDown"
               @compositionstart="isComposing = true"
               @compositionend="isComposing = false"
+              @input="adjustTextareaHeight"
+              ref="textareaRef"
               :disabled="sessionStore.isStreaming || isOffline"
             />
             <button
@@ -442,6 +542,14 @@ function handleKeyDown(event: KeyboardEvent) {
             @click="switchTab('code')"
           >
             Code
+          </button>
+          <button
+            v-if="activeTab === 'preview' && previewToken"
+            @click="retryPreview"
+            class="refresh-token-btn"
+            title="Refresh preview token"
+          >
+            ⟳
           </button>
         </div>
 
@@ -498,6 +606,8 @@ function handleKeyDown(event: KeyboardEvent) {
   color: #1d1d1f;
   padding: 12px;
   gap: 12px;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .header {
@@ -720,8 +830,10 @@ function handleKeyDown(event: KeyboardEvent) {
 }
 
 .message.agent {
-  margin-right: 48px;
-  background: #f5f5f7;
+  margin-right: 0;
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
 }
 
 .message-header {
@@ -749,6 +861,63 @@ function handleKeyDown(event: KeyboardEvent) {
   color: #1d1d1f;
 }
 
+.message-content.markdown-body {
+  white-space: normal;
+}
+
+.message-content.markdown-body p {
+  margin: 0 0 12px 0;
+}
+
+.message-content.markdown-body p:last-child {
+  margin-bottom: 0;
+}
+
+.message-content.markdown-body code {
+  background: #f0f0f0;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+.message-content.markdown-body pre {
+  background: #282c34;
+  color: #abb2bf;
+  padding: 12px 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 12px 0;
+}
+
+.message-content.markdown-body pre code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+
+.message-content.markdown-body ul,
+.message-content.markdown-body ol {
+  margin: 8px 0;
+  padding-left: 24px;
+}
+
+.message-content.markdown-body li {
+  margin: 4px 0;
+}
+
+.message-content.markdown-body strong {
+  font-weight: 600;
+}
+
+.message-content.markdown-body a {
+  color: #4f46e5;
+  text-decoration: none;
+}
+
+.message-content.markdown-body a:hover {
+  text-decoration: underline;
+}
+
 .empty-messages {
   text-align: center;
   color: #86868b;
@@ -757,6 +926,7 @@ function handleKeyDown(event: KeyboardEvent) {
 
 .input-section {
   display: flex;
+  align-items: flex-end;
   gap: 12px;
   padding: 16px 20px;
   background: #fff;
@@ -772,7 +942,13 @@ function handleKeyDown(event: KeyboardEvent) {
   background: #f5f5f7;
   color: #1d1d1f;
   font-size: 1rem;
+  line-height: 1.4;
   transition: all 0.15s;
+  resize: none;
+  min-height: 44px;
+  max-height: 144px;
+  overflow-y: auto;
+  font-family: inherit;
 }
 
 .message-input:focus {
@@ -854,6 +1030,23 @@ function handleKeyDown(event: KeyboardEvent) {
   color: #4f46e5;
   background: #eef2ff;
   font-weight: 500;
+}
+
+.refresh-token-btn {
+  margin-left: auto;
+  padding: 6px 12px;
+  background: #f5f5f7;
+  border: 1px solid #d2d2d7;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 1rem;
+  color: #1d1d1f;
+  transition: all 0.15s;
+}
+
+.refresh-token-btn:hover {
+  background: #e8e8ed;
+  border-color: #86868b;
 }
 
 .tab-content {

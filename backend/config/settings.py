@@ -267,6 +267,7 @@ ANTHROPIC_MODEL = os.environ.get('ANTHROPIC_MODEL', '')  # e.g., 'claude-opus-4-
 # Workspace Client configuration
 WORKSPACE_CLIENT_WS_URL = os.environ.get('WORKSPACE_CLIENT_WS_URL', 'ws://backend:8000')
 WORKSPACE_CLIENT_HTTP_URL = os.environ.get('WORKSPACE_CLIENT_HTTP_URL', 'http://backend:8000')
+INTERNAL_API_TOKEN = os.environ.get('ATOMSX_INTERNAL_API_TOKEN', 'dev-internal-token')
 
 # Workspace data storage configuration
 # WORKSPACE_DATA_ROOT: Path inside Celery worker container for creating directories

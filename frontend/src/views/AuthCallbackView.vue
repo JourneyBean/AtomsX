@@ -30,6 +30,7 @@ onMounted(async () => {
   justify-content: center;
   align-items: center;
   height: 100vh;
-  color: #fff;
+  color: #86868b;
+  background: #f5f5f7;
 }
 </style>

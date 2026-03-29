@@ -34,37 +34,38 @@ function getTypeClass(type: Notification['type']) {
   align-items: center;
   justify-content: space-between;
   padding: 12px 16px;
-  border-radius: 8px;
+  border-radius: 10px;
   min-width: 280px;
   max-width: 400px;
-  background: rgba(30, 30, 50, 0.95);
-  color: #fff;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  background: #fff;
+  color: #1d1d1f;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
   animation: slide-in 0.3s ease-out;
+  border: 1px solid #e5e5ea;
 }
 
 .toast-error {
-  border-left: 4px solid #ef4444;
+  border-left: 4px solid #dc2626;
 }
 
 .toast-error .toast-icon {
-  color: #ef4444;
+  color: #dc2626;
 }
 
 .toast-success {
-  border-left: 4px solid #22c55e;
+  border-left: 4px solid #059669;
 }
 
 .toast-success .toast-icon {
-  color: #22c55e;
+  color: #059669;
 }
 
 .toast-warning {
-  border-left: 4px solid #f59e0b;
+  border-left: 4px solid #d97706;
 }
 
 .toast-warning .toast-icon {
-  color: #f59e0b;
+  color: #d97706;
 }
 
 .toast-content {
@@ -89,15 +90,17 @@ function getTypeClass(type: Notification['type']) {
 .toast-close {
   background: transparent;
   border: none;
-  color: rgba(255, 255, 255, 0.6);
+  color: #86868b;
   cursor: pointer;
   padding: 4px;
   font-size: 14px;
   line-height: 1;
+  border-radius: 4px;
 }
 
 .toast-close:hover {
-  color: #fff;
+  color: #1d1d1f;
+  background: #f5f5f7;
 }
 
 @keyframes slide-in {

@@ -13,6 +13,7 @@ class AuditLog(models.Model):
         ('LOGOUT', 'User Logout'),
         ('WORKSPACE_CREATED', 'Workspace Created'),
         ('WORKSPACE_DELETED', 'Workspace Deleted'),
+        ('WORKSPACE_RECREATED', 'Workspace Recreated'),
         ('WORKSPACE_STATUS_CHANGE', 'Workspace Status Change'),
         ('WORKSPACE_ERROR', 'Workspace Error'),
         ('PREVIEW_ACCESS', 'Preview Access'),
@@ -25,6 +26,7 @@ class AuditLog(models.Model):
         ('DIND_DISCONNECTED', 'Dind Disconnected'),
         ('DIND_HEALTH_CHECK_FAILED', 'Dind Health Check Failed'),
         ('DIND_ERROR', 'Dind Error'),
+        ('TOKEN_CLEANUP', 'Token Cleanup'),
     ]
 
     id = models.BigAutoField(primary_key=True)

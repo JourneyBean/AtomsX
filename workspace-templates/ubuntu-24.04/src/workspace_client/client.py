@@ -256,8 +256,14 @@ class WSClient:
     async def run(self):
         """
         Main run loop - connects and maintains connection.
+
+        If initial connection fails, triggers reconnection mechanism.
         """
-        await self.connect()
+        success = await self.connect()
+
+        # If initial connection failed, start reconnection
+        if not success and self.should_reconnect:
+            await self._reconnect()
 
         # Keep running while connected or reconnecting
         while self.connected or (self.should_reconnect and self._receive_task):

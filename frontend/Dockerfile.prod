@@ -12,6 +12,9 @@ ARG http_proxy
 ARG https_proxy
 ARG no_proxy
 
+# npm registry mirror (defaults to npmmirror for better China connectivity)
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+
 # Vite build argument for API URL (relative path for production)
 ARG VITE_API_URL=/api
 
@@ -20,14 +23,30 @@ WORKDIR /app
 # Copy package files
 COPY package.json package-lock.json* ./
 
-# Install dependencies with proxy support
-RUN if [ -n "$HTTP_PROXY" ]; then \
+# Install dependencies with proxy support and npm mirror
+RUN npm config set registry $NPM_REGISTRY && \
+    if [ -n "$HTTP_PROXY" ]; then \
         npm config set proxy $HTTP_PROXY; \
     fi && \
     if [ -n "$HTTPS_PROXY" ]; then \
         npm config set https-proxy $HTTPS_PROXY; \
     fi && \
-    npm ci && \
+    # Retry logic: try up to 3 times with exponential backoff
+    for i in 1 2 3; do \
+        echo "Attempt $i: Installing npm dependencies..."; \
+        if npm ci --prefer-offline; then \
+            echo "npm ci succeeded on attempt $i"; \
+            break; \
+        fi; \
+        if [ $i -lt 3 ]; then \
+            sleep=$((i * 5)); \
+            echo "npm ci failed, retrying in $sleep seconds..."; \
+            sleep $sleep; \
+        else \
+            echo "npm ci failed after 3 attempts"; \
+            exit 1; \
+        fi; \
+    done && \
     npm config delete proxy 2>/dev/null || true && \
     npm config delete https-proxy 2>/dev/null || true
 

@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { ref, nextTick } from 'vue'
 import type { Session, Message } from '@/types'
 import { useNotificationStore } from '@/stores/notification'
 
@@ -96,22 +96,26 @@ export const useSessionStore = defineStore('session', () => {
 
     isStreaming.value = true
 
-    // Send message to backend
-    let taskId: string | undefined
+    // Send message and receive SSE stream in single POST request
+    const sessionId = currentSession.value.id
+    const url = `/api/sessions/${sessionId}/messages/`
+    console.log('[Session] Sending POST with SSE stream:', url)
+
     try {
-      console.log('[Session] Sending POST to messages endpoint...')
-      const response = await fetch(`/api/sessions/${currentSession.value.id}/messages/`, {
+      const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
         body: JSON.stringify({ content }),
       })
+
       console.log('[Session] POST response:', response.status)
-      if (response.ok) {
-        const data = await response.json()
-        console.log('[Session] POST data:', data)
-        taskId = data.task_id
-      } else {
+
+      // Check content type
+      const contentType = response.headers.get('content-type')
+      console.log('[Session] Content-Type:', contentType)
+
+      if (!response.ok) {
         const notificationStore = useNotificationStore()
         notificationStore.showError('Failed to send message')
         agentMessage.status = 'error'
@@ -119,6 +123,103 @@ export const useSessionStore = defineStore('session', () => {
         closeStream()
         return
       }
+
+      // Process SSE stream from POST response
+      const reader = response.body?.getReader()
+      if (!reader) {
+        throw new Error('No response body')
+      }
+
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      // Helper to update message properties
+      const updateMessage = (updates: Partial<Message>) => {
+        const msg = messages.value.find((m: Message) => m.id === agentMessage.id)
+        if (msg) {
+          Object.assign(msg, updates)
+          nextTick()
+        }
+      }
+
+      const processLine = (line: string) => {
+        console.log('[SSE] Received line:', line)
+        if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.slice(6))
+            console.log('[SSE] Parsed data:', data)
+
+            if (data.type === 'text') {
+              const msg = messages.value.find((m: Message) => m.id === agentMessage.id)
+              if (msg) {
+                msg.content += data.content
+                nextTick()
+              }
+            } else if (data.type === 'tool_use') {
+              console.log('Tool use:', data.tool_name, data.tool_input)
+              const isFileOperation = FILE_OPERATION_TOOLS.some(tool => {
+                if (tool.endsWith('*')) {
+                  return data.tool_name.startsWith(tool.slice(0, -1))
+                }
+                return data.tool_name === tool
+              })
+              if (isFileOperation && fileOperationCallback) {
+                setTimeout(() => fileOperationCallback!(), 500)
+              }
+            } else if (data.type === 'done') {
+              updateMessage({ status: 'complete', content: data.response || agentMessage.content })
+              closeStream()
+            } else if (data.type === 'error') {
+              updateMessage({ status: 'error', content: data.error || data.error_message || 'An error occurred' })
+              closeStream()
+            } else if (data.type === 'interrupted') {
+              updateMessage({ status: 'interrupted' })
+              closeStream()
+            } else if (data.type === 'connected') {
+              console.log('[SSE] Connected')
+            }
+          } catch (e) {
+            console.error('[SSE] Parse error:', e)
+          }
+        }
+      }
+
+      // Read stream chunks
+      const readChunk = async () => {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) {
+            console.log('[SSE] Stream done')
+            if (buffer.trim()) {
+              buffer.split('\n\n').forEach(block => {
+                block.split('\n').forEach(line => {
+                  if (line.trim()) processLine(line)
+                })
+              })
+            }
+            if (agentMessage.status === 'streaming') {
+              updateMessage({ status: 'complete' })
+            }
+            closeStream()
+            break
+          }
+
+          buffer += decoder.decode(value, { stream: true })
+
+          // Process complete SSE blocks
+          const blocks = buffer.split('\n\n')
+          buffer = blocks.pop() || ''
+
+          blocks.forEach(block => {
+            block.split('\n').forEach(line => {
+              if (line.trim()) processLine(line)
+            })
+          })
+        }
+      }
+
+      await readChunk()
+
     } catch (err) {
       console.error('[Session] POST error:', err)
       const notificationStore = useNotificationStore()
@@ -126,13 +227,7 @@ export const useSessionStore = defineStore('session', () => {
       agentMessage.status = 'error'
       agentMessage.content = 'Failed to send message'
       closeStream()
-      return
     }
-
-    // Connect to SSE stream
-    const sessionId = currentSession.value.id
-    console.log('[Session] Calling connectToStream for session:', sessionId)
-    connectToStream(sessionId, agentMessage, taskId)
   }
 
   async function resumeSession(historySessionId: string, content: string): Promise<boolean> {
@@ -162,8 +257,12 @@ export const useSessionStore = defineStore('session', () => {
 
     isStreaming.value = true
 
+    const sessionId = currentSession.value.id
+    const url = `/api/sessions/${sessionId}/resume/`
+    console.log('[Session] Sending resume POST with SSE stream:', url)
+
     try {
-      const response = await fetch(`/api/sessions/${currentSession.value.id}/resume/`, {
+      const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -173,13 +272,7 @@ export const useSessionStore = defineStore('session', () => {
         }),
       })
 
-      if (response.ok) {
-        const data = await response.json()
-        // Connect to SSE stream for response
-        const sessionId = currentSession.value.id
-        connectToStream(sessionId, agentMessage)
-        return true
-      } else {
+      if (!response.ok) {
         const notificationStore = useNotificationStore()
         notificationStore.showError('Failed to resume session')
         agentMessage.status = 'error'
@@ -187,37 +280,8 @@ export const useSessionStore = defineStore('session', () => {
         closeStream()
         return false
       }
-    } catch {
-      const notificationStore = useNotificationStore()
-      notificationStore.showError('Failed to resume session')
-      agentMessage.status = 'error'
-      agentMessage.content = 'Failed to resume session'
-      closeStream()
-      return false
-    }
-  }
 
-  function connectToStream(sessionId: string, agentMessage: Message, _taskId?: string) {
-    // Close existing connection
-    if (eventSource.value) {
-      eventSource.value.close()
-    }
-
-    // EventSource doesn't support credentials option, so we need to use fetch
-    // with ReadableStream for SSE with authentication
-    const url = `/api/sessions/${sessionId}/stream/`
-    console.log('[SSE] Connecting to:', url)
-    console.log('[SSE] About to fetch...')
-
-    fetch(url, {
-      credentials: 'include',  // Include cookies for authentication
-    }).then(response => {
-      console.log('[SSE] Response status:', response.status)
-      console.log('[SSE] Response headers:', Object.fromEntries(response.headers.entries()))
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`)
-      }
-
+      // Process SSE stream from POST response
       const reader = response.body?.getReader()
       if (!reader) {
         throw new Error('No response body')
@@ -226,51 +290,41 @@ export const useSessionStore = defineStore('session', () => {
       const decoder = new TextDecoder()
       let buffer = ''
 
-      const processLine = (line: string) => {
-        console.log('[SSE] Received line:', line)
-        if (line.startsWith('data: ')) {
-          const data = JSON.parse(line.slice(6))
-          console.log('[SSE] Parsed data:', data)
+      const updateMessage = (updates: Partial<Message>) => {
+        const msg = messages.value.find((m: Message) => m.id === agentMessage.id)
+        if (msg) {
+          Object.assign(msg, updates)
+          nextTick()
+        }
+      }
 
-          if (data.type === 'text') {
-            agentMessage.content += data.content
-          } else if (data.type === 'tool_use') {
-            console.log('Tool use:', data.tool_name, data.tool_input)
-            // Check if this is a file operation tool
-            const isFileOperation = FILE_OPERATION_TOOLS.some(tool => {
-              if (tool.endsWith('*')) {
-                return data.tool_name.startsWith(tool.slice(0, -1))
+      const processLine = (line: string) => {
+        if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.slice(6))
+            if (data.type === 'text') {
+              const msg = messages.value.find((m: Message) => m.id === agentMessage.id)
+              if (msg) {
+                msg.content += data.content
+                nextTick()
               }
-              return data.tool_name === tool
-            })
-            if (isFileOperation && fileOperationCallback) {
-              // Delay refresh slightly to allow file operation to complete
-              setTimeout(() => fileOperationCallback!(), 500)
+            } else if (data.type === 'done') {
+              updateMessage({ status: 'complete' })
+              closeStream()
+            } else if (data.type === 'error') {
+              updateMessage({ status: 'error', content: data.error || 'An error occurred' })
+              closeStream()
             }
-          } else if (data.type === 'done') {
-            agentMessage.status = 'complete'
-            if (data.response) {
-              agentMessage.content = data.response
-            }
-            closeStream()
-          } else if (data.type === 'error') {
-            agentMessage.status = 'error'
-            agentMessage.content = data.error || data.error_message || 'An error occurred'
-            closeStream()
-          } else if (data.type === 'interrupted') {
-            agentMessage.status = 'interrupted'
-            closeStream()
-          } else if (data.type === 'connected') {
-            console.log('SSE connected:', data.session_id)
+          } catch (e) {
+            console.error('[SSE] Parse error:', e)
           }
         }
       }
 
-      const readChunk = (): Promise<void> | undefined => {
-        return reader.read().then(({ done, value }) => {
+      const readChunk = async () => {
+        while (true) {
+          const { done, value } = await reader.read()
           if (done) {
-            console.log('[SSE] Stream done')
-            // Process any remaining buffer
             if (buffer.trim()) {
               buffer.split('\n\n').forEach(block => {
                 block.split('\n').forEach(line => {
@@ -279,39 +333,34 @@ export const useSessionStore = defineStore('session', () => {
               })
             }
             if (agentMessage.status === 'streaming') {
-              agentMessage.status = 'complete'
+              updateMessage({ status: 'complete' })
             }
             closeStream()
-            return
+            break
           }
 
           buffer += decoder.decode(value, { stream: true })
-
-          // Process complete SSE blocks (ended with \n\n)
           const blocks = buffer.split('\n\n')
-          buffer = blocks.pop() || ''  // Keep incomplete block in buffer
-
+          buffer = blocks.pop() || ''
           blocks.forEach(block => {
             block.split('\n').forEach(line => {
               if (line.trim()) processLine(line)
             })
           })
-
-          return readChunk()
-        })
+        }
       }
 
-      return readChunk()
-    }).catch(err => {
-      console.error('[SSE] Error:', err)
-      if (agentMessage.status === 'streaming') {
-        agentMessage.status = 'error'
-        agentMessage.content = 'Connection failed'
-      }
+      await readChunk()
+      return true
+
+    } catch {
+      const notificationStore = useNotificationStore()
+      notificationStore.showError('Failed to resume session')
+      agentMessage.status = 'error'
+      agentMessage.content = 'Failed to resume session'
       closeStream()
-    })
-
-    console.log('[SSE] Fetch initiated')
+      return false
+    }
   }
 
   async function interrupt(taskId?: string): Promise<void> {

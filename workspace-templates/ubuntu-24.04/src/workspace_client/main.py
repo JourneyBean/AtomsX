@@ -61,6 +61,8 @@ class WorkspaceClient:
 
         self.running = False
         self._shutdown_event = asyncio.Event()
+        # Track background tasks
+        self._background_tasks: dict[str, asyncio.Task] = {}
 
     async def start(self):
         """
@@ -93,6 +95,16 @@ class WorkspaceClient:
         """
         logger.info("Shutting down Workspace Client")
         self.running = False
+
+        # Cancel all background tasks
+        for task_id, task in self._background_tasks.items():
+            if not task.done():
+                task.cancel()
+                logger.info(f"Cancelled background task: {task_id}")
+
+        # Wait for tasks to complete
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks.values(), return_exceptions=True)
 
         # Cleanup sessions
         await self.session_manager.cleanup_all()
@@ -130,9 +142,11 @@ class WorkspaceClient:
 
         try:
             if message_type == "task":
+                # Run task in background to not block other messages
                 await self._handle_task(message)
 
             elif message_type == "resume":
+                # Run resume in background to not block other messages
                 await self._handle_resume(message)
 
             elif message_type == "interrupt":
@@ -179,22 +193,39 @@ class WorkspaceClient:
             await self._send_error(session_id, "Missing session_id or prompt")
             return
 
+        # Start session (quick operation)
         try:
-            # Start new session
-            logger.info(f"Starting session {session_id}...")
             session = await self.session_manager.start_session(session_id)
             logger.info(f"Session {session_id} started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start session: {e}")
+            await self._send_error(session_id, str(e))
+            return
 
-            # Send acknowledgment
-            await self.ws_client.send({
-                "type": "started",
-                "session_id": session_id,
-                "history_session_id": session.history_session_id,
-            })
-            logger.info(f"Sent 'started' message for session {session_id}")
+        # Send acknowledgment
+        await self.ws_client.send({
+            "type": "started",
+            "session_id": session_id,
+            "history_session_id": session.history_session_id,
+        })
 
-            # Execute task with streaming
+        # Execute task in background to not block WebSocket
+        task = asyncio.create_task(
+            self._execute_session_task(session_id, prompt)
+        )
+        self._background_tasks[session_id] = task
+        task.add_done_callback(lambda t: self._background_tasks.pop(session_id, None))
+
+    async def _execute_session_task(self, session_id: str, prompt: str):
+        """
+        Execute session task in background.
+
+        This runs independently so WebSocket can handle other messages.
+        """
+        try:
             logger.info(f"Executing task with prompt: {prompt[:100]}...")
+            session = self.session_manager.sessions.get(session_id)
+
             response = await self.session_manager.send_message(
                 session_id,
                 prompt,
@@ -203,7 +234,7 @@ class WorkspaceClient:
             logger.info(f"Task completed, response length: {len(response) if response else 0}")
 
             # Send completion if not waiting for user input
-            if not session.pending_user_input:
+            if session and not session.pending_user_input:
                 await self.ws_client.send({
                     "type": "complete",
                     "session_id": session_id,
@@ -232,21 +263,40 @@ class WorkspaceClient:
             )
             return
 
+        # Resume session (quick operation)
         try:
-            # Resume session from history folder
             session = await self.session_manager.resume_session(
                 session_id,
                 history_session_id,
             )
+        except Exception as e:
+            logger.error(f"Failed to resume session: {e}")
+            await self._send_error(session_id, str(e))
+            return
 
-            # Send acknowledgment
-            await self.ws_client.send({
-                "type": "resumed",
-                "session_id": session_id,
-                "history_session_id": history_session_id,
-            })
+        # Send acknowledgment
+        await self.ws_client.send({
+            "type": "resumed",
+            "session_id": session_id,
+            "history_session_id": history_session_id,
+        })
 
-            # Execute task
+        # Execute task in background to not block WebSocket
+        task = asyncio.create_task(
+            self._execute_resume_task(session_id, prompt)
+        )
+        self._background_tasks[session_id] = task
+        task.add_done_callback(lambda t: self._background_tasks.pop(session_id, None))
+
+    async def _execute_resume_task(self, session_id: str, prompt: str):
+        """
+        Execute resumed session task in background.
+
+        This runs independently so WebSocket can handle other messages.
+        """
+        try:
+            session = self.session_manager.sessions.get(session_id)
+
             response = await self.session_manager.send_message(
                 session_id,
                 prompt,
@@ -254,7 +304,7 @@ class WorkspaceClient:
             )
 
             # Send completion if not waiting for user input
-            if not session.pending_user_input:
+            if session and not session.pending_user_input:
                 await self.ws_client.send({
                     "type": "complete",
                     "session_id": session_id,

@@ -221,6 +221,9 @@ services:
         condition: service_started
       frontend:
         condition: service_started
+    networks:
+      - default
+      - workspaces
 
 # =============================================================================
 # Volumes
@@ -237,3 +240,6 @@ volumes:
 networks:
   default:
     name: atomsx-network
+  workspaces:
+    name: atomsx-workspaces
+    external: true  # Created by workspace containers, not managed by compose

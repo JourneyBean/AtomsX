@@ -89,3 +89,22 @@ class Session(models.Model):
                     msg['content'] = content
                 break
         self.save(update_fields=['messages', 'updated_at'])
+
+    async def aadd_message(self, role: str, content: str, status: str = 'complete'):
+        """
+        Async version of add_message.
+        """
+        import uuid
+        from datetime import datetime
+        from asgiref.sync import sync_to_async
+
+        message = {
+            'id': str(uuid.uuid4()),
+            'role': role,
+            'content': content,
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'status': status,
+        }
+        self.messages.append(message)
+        await sync_to_async(self.save)(update_fields=['messages', 'updated_at'])
+        return message

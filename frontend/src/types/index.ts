@@ -10,7 +10,7 @@ export interface User {
 export interface Workspace {
   id: string
   name: string
-  status: 'creating' | 'running' | 'stopped' | 'error' | 'deleting'
+  status: 'creating' | 'running' | 'stopped' | 'error' | 'recreating' | 'deleting'
   container_id: string | null
   preview_url: string | null
   created_at: string

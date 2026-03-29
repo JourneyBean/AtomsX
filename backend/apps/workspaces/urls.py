@@ -5,22 +5,32 @@ from django.urls import path, re_path
 from .views import (
     WorkspaceListView,
     WorkspaceDetailView,
+    WorkspaceRecreateView,
     WorkspaceFileTreeView,
     WorkspaceFileContentView,
     InternalAgentConfigView,
     WorkspaceHistoryListView,
     WorkspaceHistoryMessagesView,
+    PreviewTokenView,
 )
 
 urlpatterns = [
     path('', WorkspaceListView.as_view(), name='workspace-list'),
     path('<uuid:workspace_id>/', WorkspaceDetailView.as_view(), name='workspace-detail'),
+    # Recreate workspace with latest image
+    path('<uuid:workspace_id>/recreate/', WorkspaceRecreateView.as_view(),
+         name='workspace-recreate'),
+    # Preview token generation
+    path('<uuid:workspace_id>/preview-token/', PreviewTokenView.as_view(),
+         name='workspace-preview-token'),
     # History - more specific route first
     path('<uuid:workspace_id>/history/<str:history_session_id>/',
          WorkspaceHistoryMessagesView.as_view(), name='workspace-history-messages'),
-    path('<uuid:workspace_id>/history/', WorkspaceHistoryListView.as_view(), name='workspace-history'),
+    path('<uuid:workspace_id>/history/', WorkspaceHistoryListView.as_view(),
+         name='workspace-history'),
     # File browser endpoints
-    path('<uuid:workspace_id>/tree/', WorkspaceFileTreeView.as_view(), name='workspace-file-tree'),
+    path('<uuid:workspace_id>/tree/', WorkspaceFileTreeView.as_view(),
+         name='workspace-file-tree'),
     re_path(r'^(?P<workspace_id>[0-9a-f-]{36})/files/(?P<file_path>.+)$',
             WorkspaceFileContentView.as_view(), name='workspace-file-content'),
     # Internal API for Workspace Client (uses X-Internal-Token auth)

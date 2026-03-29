@@ -24,6 +24,7 @@ from typing import Any, Optional, AsyncIterator
 import httpx
 
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, TextBlock, ToolUseBlock
+from claude_agent_sdk.types import StreamEvent
 
 from .config import settings
 
@@ -46,7 +47,49 @@ ENV_CONTEXT = """
 - **用户数据目录**: /home/user/data (如果存在)
 - 这是用户持久化数据的存储位置
 
+## 进程管理
+
+容器使用 supervisord 管理多个进程。你可以使用 `supervisorctl` 命令：
+
+- 查看进程状态: `supervisorctl status`
+- 重启进程: `supervisorctl restart workspace-client` 或 `supervisorctl restart preview-server`
+- 查看日志: `supervisorctl tail workspace-client`
+
+## 实时预览
+
+你可以启动一个开发服务器，用户将能够通过预览 URL 实时查看你的工作成果。
+
+### 预览配置
+- **预览端口**: 3000 (容器内部)
+- **启动脚本**: /home/user/workspace/start_app.sh
+
+### 如何启动预览
+
+1. 创建 `start_app.sh` 脚本在 workspace 目录
+2. 确保脚本可执行: `chmod +x start_app.sh`
+3. 预览服务会自动启动
+
+### 启动脚本示例
+
+```bash
+#!/bin/bash
+npm run dev -- --port 3000 --host 0.0.0.0
+```
+
+### 常见框架启动命令
+
+- **Vite**: `npm run dev -- --port 3000 --host 0.0.0.0`
+- **Next.js**: `npm run dev -- -p 3000 -H 0.0.0.0`
+- **Python HTTP**: `python3 -m http.server 3000 --bind 0.0.0.0`
+- **Flask**: `flask run --host 0.0.0.0 --port 3000`
+- **FastAPI**: `uvicorn main:app --host 0.0.0.0 --port 3000`
+
 ### 重要提示
+- 必须监听 `0.0.0.0:3000`，不能只监听 localhost
+- 如果 start_app.sh 不存在，将显示占位页面
+- 用户可以通过预览 URL 立即查看你的工作成果
+
+## 其他提示
 - 不要使用 `/Users/...` 或其他宿主机路径
 - 不要假设你在特定的开发环境中
 - 当前工作目录是你的工作空间根目录
@@ -199,6 +242,7 @@ class SessionManager:
             "cwd": Path("/home/user/workspace"),
             "env": env_vars,  # Always pass a dict, even if empty
             "permission_mode": "bypassPermissions",  # Allow all tool calls without user confirmation
+            "include_partial_messages": True,  # Enable streaming output
             "system_prompt": {
                 "type": "preset",
                 "preset": "claude_code",
@@ -277,6 +321,7 @@ class SessionManager:
             "cwd": Path("/home/user/workspace"),
             "env": env_vars,  # Always pass a dict, even if empty
             "permission_mode": "bypassPermissions",  # Allow all tool calls without user confirmation
+            "include_partial_messages": True,  # Enable streaming output
             "system_prompt": {
                 "type": "preset",
                 "preset": "claude_code",
@@ -399,27 +444,67 @@ This is a continuation of a previous conversation. Here is the context:
             logger.info(f"Query sent, waiting for response...")
 
             full_response = ""
+            current_tool = None
 
-            # Stream responses
+            # Stream responses - this runs in background task, not blocking WebSocket
             msg_count = 0
             async for msg in session.client.receive_response():
                 msg_count += 1
-                logger.info(f"Received message #{msg_count}: type={type(msg).__name__}")
+
                 if session.is_interrupted:
                     logger.info(f"Session {session_id} was interrupted")
                     break
 
-                # Handle different message types
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            full_response += block.text
+                # Handle StreamEvent for real-time streaming
+                if isinstance(msg, StreamEvent):
+                    event = msg.event
+                    event_type = event.get("type")
+
+                    if event_type == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            # Stream text in real-time
+                            text = delta.get("text", "")
+                            full_response += text
+                            logger.info(f"[STREAM] Text delta received: {repr(text[:50])}...")
                             if stream_callback:
                                 await stream_callback({
                                     "type": "stream",
                                     "session_id": session_id,
-                                    "content": block.text,
+                                    "content": text,
                                 })
+                                logger.info(f"[STREAM] Callback completed for text delta")
+                        elif delta.get("type") == "input_json_delta":
+                            # Tool input streaming - just log for now
+                            if current_tool:
+                                chunk = delta.get("partial_json", "")
+                                logger.debug(f"Tool {current_tool} input chunk: {chunk}")
+
+                    elif event_type == "content_block_start":
+                        content_block = event.get("content_block", {})
+                        if content_block.get("type") == "tool_use":
+                            current_tool = content_block.get("name")
+                            tool_id = content_block.get("id", "")
+                            logger.info(f"Tool call starting: {current_tool}")
+                            if stream_callback:
+                                await stream_callback({
+                                    "type": "tool_use",
+                                    "session_id": session_id,
+                                    "tool_name": current_tool,
+                                    "tool_input": {},  # Will be filled in later
+                                })
+
+                    elif event_type == "content_block_stop":
+                        if current_tool:
+                            logger.info(f"Tool call complete: {current_tool}")
+                            current_tool = None
+
+                # Handle complete AssistantMessage
+                elif isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            # Text already streamed via StreamEvent, just accumulate
+                            pass
                         elif isinstance(block, ToolUseBlock):
                             if stream_callback:
                                 await stream_callback({
@@ -428,10 +513,6 @@ This is a continuation of a previous conversation. Here is the context:
                                     "tool_name": block.name,
                                     "tool_input": block.input,
                                 })
-
-                # Check for user input requests (result messages with ask permission)
-                # The new SDK handles this through permission_mode and hooks
-                # For now, we'll detect it from the message flow
 
             # Save message to history
             await self._save_message_history(session, message, full_response)

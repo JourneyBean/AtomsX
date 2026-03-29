@@ -34,6 +34,8 @@ RUN HTTP_PROXY=${HTTP_PROXY} HTTPS_PROXY=${HTTPS_PROXY} NO_PROXY=${NO_PROXY} \
     ca-certificates \
     gnupg \
     build-essential \
+    # Process management
+    supervisor \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy uv binary from official image
@@ -57,6 +59,8 @@ RUN mkdir -p /home/user/.config/uv \
 # Set up workspace directories (will be mounted separately at runtime)
 RUN mkdir -p /home/user/workspace \
     && mkdir -p /home/user/history \
+    && mkdir -p /home/user/logs \
+    && mkdir -p /home/user/.var/run \
     && chown -R user:user /home/user
 
 # Install nvm and Node.js 24 for the user
@@ -91,8 +95,13 @@ ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 WORKDIR /opt/workspace-client
 RUN uv sync
 
-# Make entrypoint executable
-RUN chmod +x /opt/workspace-client/scripts/entrypoint.sh
+# Make scripts executable
+RUN chmod +x /opt/workspace-client/scripts/start_preview.sh
+
+# Copy supervisord configuration
+RUN mkdir -p /var/log/supervisor
+COPY scripts/supervisord.conf /etc/supervisor/supervisord.conf
+COPY scripts/programs.conf /etc/supervisor/conf.d/programs.conf
 
 # Set up working directory
 WORKDIR /home/user/workspace
@@ -103,9 +112,9 @@ USER user
 # Expose preview server port
 EXPOSE 3000
 
-# Health check for workspace-client process
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD pgrep -f "workspace_client.main" > /dev/null || exit 1
+# Health check for supervisord and its child processes
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD pgrep -f "supervisord" > /dev/null && pgrep -f "workspace_client.main" > /dev/null || exit 1
 
-# Entrypoint starts workspace-client
-ENTRYPOINT ["/opt/workspace-client/scripts/entrypoint.sh"]
+# Entrypoint starts supervisord which manages workspace-client and preview-server
+ENTRYPOINT ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]

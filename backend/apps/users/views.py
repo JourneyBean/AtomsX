@@ -180,27 +180,51 @@ class AuthVerifyView(View):
     """
     Verify authentication and workspace ownership for Preview access.
     Called by OpenResty gateway before proxying to workspace containers.
+
+    Supports two authentication methods:
+    1. Session cookie (standard Django auth)
+    2. Preview token via query parameter (for iframe embedding)
     """
 
     def get(self, request):
-        # Check if user is authenticated
-        if not request.user.is_authenticated:
+        user = None
+
+        # Try token-based authentication first
+        token = request.GET.get('token')
+        workspace_id = request.headers.get('X-Workspace-Id') or request.GET.get('workspace_id')
+
+        if token and workspace_id:
+            from apps.workspaces.preview_token import validate_preview_token
+            from apps.users.models import User
+
+            token_data = validate_preview_token(token, workspace_id)
+            if token_data:
+                try:
+                    user = User.objects.get(id=token_data['user_id'])
+                except User.DoesNotExist:
+                    pass
+
+        # Fall back to session authentication
+        if not user and request.user.is_authenticated:
+            user = request.user
+
+        # Check if we have an authenticated user
+        if not user:
             return JsonResponse(
                 {'error': 'unauthorized', 'message': 'Authentication required'},
                 status=401,
             )
 
-        workspace_id = request.headers.get('X-Workspace-Id') or request.GET.get('workspace_id')
         if workspace_id:
             # Check workspace ownership
             from apps.workspaces.models import Workspace
 
             try:
                 workspace = Workspace.objects.get(id=workspace_id)
-                if workspace.owner != request.user:
+                if workspace.owner != user:
                     create_audit_log(
                         event_type='PREVIEW_ACCESS_DENIED',
-                        user_id=request.user.id,
+                        user_id=user.id,
                         workspace_id=workspace_id,
                         ip_address=request.META.get('REMOTE_ADDR'),
                         reason='not_owner',
@@ -213,13 +237,13 @@ class AuthVerifyView(View):
                 # Return user info and container host
                 create_audit_log(
                     event_type='PREVIEW_ACCESS',
-                    user_id=request.user.id,
+                    user_id=user.id,
                     workspace_id=workspace_id,
                     ip_address=request.META.get('REMOTE_ADDR'),
                 )
 
                 return JsonResponse({
-                    'user_id': str(request.user.id),
+                    'user_id': str(user.id),
                     'workspace_id': str(workspace_id),
                     'container_host': workspace.container_host if hasattr(workspace, 'container_host') else None,
                 })
@@ -232,6 +256,6 @@ class AuthVerifyView(View):
 
         # No workspace_id provided, just verify authentication
         return JsonResponse({
-            'user_id': str(request.user.id),
+            'user_id': str(user.id),
             'authenticated': True,
         })

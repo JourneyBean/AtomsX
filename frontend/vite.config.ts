@@ -12,6 +12,10 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
+    allowedHosts: [
+      'atomsx.mewwoof.cn',
+      'preview.atomsx.mewwoof.cn',
+    ],
     proxy: {
       '/api': {
         // Use Docker service name 'backend' instead of localhost

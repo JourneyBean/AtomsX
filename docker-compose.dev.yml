@@ -82,6 +82,7 @@ services:
   gateway:
     ports:
       - "18080:80"  # Use 18080 to avoid conflict with authentik on 80
+      - "18081:443"
 
   # ===========================================================================
   # Disable dind in development - we use host Docker socket directly
