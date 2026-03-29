@@ -229,3 +229,94 @@ Interrupt the current agent response.
   "task_id": "celery-task-id"
 }
 ```
+
+---
+
+### POST /api/sessions/:id/resume
+Resume a session from Claude history.
+
+**Request Body:**
+```json
+{
+  "history_session_id": "20260328-1425-a3f2",
+  "content": "Continue from where we left off"
+}
+```
+
+**Response:**
+```json
+{
+  "status": "resume_requested",
+  "history_session_id": "20260328-1425-a3f2",
+  "transport": "websocket"
+}
+```
+
+---
+
+## History
+
+### GET /api/workspaces/:id/history/
+Get Claude session history for a workspace.
+
+**Response:** `200 OK`
+```json
+{
+  "sessions": [
+    {
+      "history_session_id": "20260328-1425-a3f2",
+      "first_message": "Create a login page with email and password...",
+      "last_activity": "2026-03-28T14:30:00Z"
+    },
+    {
+      "history_session_id": "20260327-0815-b4c1",
+      "first_message": "Add a navigation component...",
+      "last_activity": "2026-03-27T08:20:00Z"
+    }
+  ]
+}
+```
+
+**Error Responses:**
+
+`503 Service Unavailable` - Workspace client is offline or request timed out
+```json
+{
+  "error": "workspace client offline"
+}
+```
+
+---
+
+## WebSocket Messages
+
+### Backend → Workspace Client
+
+#### get_history
+Request history list from Workspace Client.
+
+```json
+{
+  "type": "get_history",
+  "request_id": "uuid"
+}
+```
+
+### Workspace Client → Backend
+
+#### history_list
+Response containing history sessions.
+
+```json
+{
+  "type": "history_list",
+  "request_id": "uuid",
+  "sessions": [
+    {
+      "history_session_id": "20260328-1425-a3f2",
+      "first_message": "Create a login page...",
+      "last_activity": "2026-03-28T14:30:00Z"
+    }
+  ]
+}
+```

@@ -12,6 +12,7 @@ const workspaces = ref<Workspace[]>([])
 const isLoading = ref(false)
 const newWorkspaceName = ref('')
 const isCreating = ref(false)
+const isComposing = ref(false) // IME composition state
 
 onMounted(async () => {
   await fetchWorkspaces()
@@ -83,6 +84,12 @@ function openWorkspace(id: string) {
 function handleLogout() {
   authStore.logout()
 }
+
+function handleKeyDown(event: KeyboardEvent) {
+  if (event.key === 'Enter' && !isComposing.value) {
+    createWorkspace()
+  }
+}
 </script>
 
 <template>
@@ -108,7 +115,9 @@ function handleLogout() {
           v-model="newWorkspaceName"
           placeholder="New workspace name"
           class="input"
-          @keyup.enter="createWorkspace"
+          @keydown="handleKeyDown"
+          @compositionstart="isComposing = true"
+          @compositionend="isComposing = false"
         />
         <button @click="createWorkspace" :disabled="isCreating" class="create-btn">
           {{ isCreating ? 'Creating...' : 'Create' }}

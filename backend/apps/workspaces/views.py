@@ -729,3 +729,232 @@ class WorkspaceFileContentView(APIView):
                     {'error': 'Error reading file'},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class WorkspaceHistoryListView(APIView):
+    """
+    API view for getting Claude session history from Workspace Client.
+
+    GET /api/workspaces/:id/history/
+
+    Returns list of history sessions sorted by last_activity descending.
+    Each session includes: history_session_id, first_message, last_activity.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, workspace_id):
+        """
+        Get Claude session history for a workspace.
+
+        Sends a WebSocket message to Workspace Client and waits for response.
+        Returns 503 if Workspace Client is not connected or times out.
+        """
+        import uuid
+        import json
+        import time
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+        import redis
+
+        workspace = get_object_or_404(Workspace, id=workspace_id)
+
+        # Check ownership
+        if workspace.owner != request.user:
+            return Response(
+                {'error': 'Access denied'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Check workspace is running
+        if workspace.status != 'running':
+            return Response(
+                {'error': f'Workspace is {workspace.status}, cannot get history'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        # Get channel layer
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            return Response(
+                {'error': 'WebSocket layer not available'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        # Generate unique request ID
+        request_id = str(uuid.uuid4())
+
+        # Get Redis client for response storage
+        r = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=int(settings.REDIS_PORT),
+            db=2,
+            decode_responses=True,
+        )
+
+        try:
+            # Set pending request in Redis
+            r.set(f'history_request:{request_id}', 'pending', ex=10)
+
+            # Send get_history request via WebSocket
+            async_to_sync(channel_layer.group_send)(
+                f'workspace_{workspace_id}',
+                {
+                    'type': 'history.message',
+                    'request_id': request_id,
+                }
+            )
+
+            # Poll for response (wait up to 5 seconds)
+            max_wait = 5.0
+            poll_interval = 0.1
+            elapsed = 0.0
+
+            while elapsed < max_wait:
+                response_data = r.get(f'history_request:{request_id}')
+
+                if response_data and response_data != 'pending':
+                    # Got response
+                    sessions = json.loads(response_data)
+                    return Response({'sessions': sessions})
+
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+
+            # Timeout - Workspace Client not responding
+            logger.warning(f'History request timeout for workspace {workspace_id}')
+            return Response(
+                {'error': 'workspace client timeout'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        except Exception as e:
+            logger.error(f'Error getting history: {e}')
+            return Response(
+                {'error': 'Failed to get history'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        finally:
+            # Cleanup Redis
+            r.delete(f'history_request:{request_id}')
+            r.close()
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class WorkspaceHistoryMessagesView(APIView):
+    """
+    API view for getting messages from a specific Claude session history.
+
+    GET /api/workspaces/:id/history/:history_session_id/
+
+    Returns list of messages from the history session.
+    Each message includes: role, content, timestamp, status.
+
+    This endpoint does NOT call Claude Agent SDK - it just retrieves
+    stored messages from the history folder.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, workspace_id, history_session_id):
+        """
+        Get messages from a specific history session.
+
+        Sends a WebSocket message to Workspace Client and waits for response.
+        Returns 503 if Workspace Client is not connected or times out.
+        """
+        import uuid
+        import json
+        import time
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+        import redis
+
+        workspace = get_object_or_404(Workspace, id=workspace_id)
+
+        # Check ownership
+        if workspace.owner != request.user:
+            return Response(
+                {'error': 'Access denied'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Check workspace is running
+        if workspace.status != 'running':
+            return Response(
+                {'error': f'Workspace is {workspace.status}, cannot get history'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        # Get channel layer
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            return Response(
+                {'error': 'WebSocket layer not available'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        # Generate unique request ID
+        request_id = str(uuid.uuid4())
+
+        # Get Redis client for response storage
+        r = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=int(settings.REDIS_PORT),
+            db=2,
+            decode_responses=True,
+        )
+
+        try:
+            # Set pending request in Redis
+            r.set(f'history_messages_request:{request_id}', 'pending', ex=10)
+
+            # Send get_history_messages request via WebSocket
+            async_to_sync(channel_layer.group_send)(
+                f'workspace_{workspace_id}',
+                {
+                    'type': 'history_messages.message',
+                    'request_id': request_id,
+                    'history_session_id': history_session_id,
+                }
+            )
+
+            # Poll for response (wait up to 5 seconds)
+            max_wait = 5.0
+            poll_interval = 0.1
+            elapsed = 0.0
+
+            while elapsed < max_wait:
+                response_data = r.get(f'history_messages_request:{request_id}')
+
+                if response_data and response_data != 'pending':
+                    # Got response
+                    data = json.loads(response_data)
+                    return Response({
+                        'messages': data.get('messages', []),
+                        'history_session_id': data.get('history_session_id'),
+                    })
+
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+
+            # Timeout - Workspace Client not responding
+            logger.warning(f'History messages request timeout for workspace {workspace_id}')
+            return Response(
+                {'error': 'workspace client timeout'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        except Exception as e:
+            logger.error(f'Error getting history messages: {e}')
+            return Response(
+                {'error': 'Failed to get history messages'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        finally:
+            # Cleanup Redis
+            r.delete(f'history_messages_request:{request_id}')
+            r.close()

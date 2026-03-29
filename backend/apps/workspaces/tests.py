@@ -679,3 +679,71 @@ class TestUserDataPathComputation:
             result = compute_user_data_path(uuid_str, '/var/opt/atomsx')
             expected = f'/var/opt/atomsx/{first_char}/{second_char}/{uuid_str}'
             assert result == expected
+
+
+@pytest.mark.django_db
+class TestWorkspaceHistoryAPI:
+    """Tests for the Workspace History API."""
+
+    def test_get_history_unauthorized(self, factory, user, other_user):
+        """Test getting history for another user's workspace."""
+        other_workspace = Workspace.objects.create(
+            owner=other_user,
+            name='Other Workspace',
+            status='running',
+        )
+
+        from apps.workspaces.views import WorkspaceHistoryListView
+        request = factory.get(f'/api/workspaces/{other_workspace.id}/history/')
+        request.user = user
+
+        view = WorkspaceHistoryListView.as_view()
+        response = view(request, workspace_id=other_workspace.id)
+
+        assert response.status_code == 403
+
+    def test_get_history_workspace_not_running(self, factory, user):
+        """Test getting history for non-running workspace."""
+        workspace = Workspace.objects.create(
+            owner=user,
+            name='Stopped Workspace',
+            status='stopped',
+        )
+
+        from apps.workspaces.views import WorkspaceHistoryListView
+        request = factory.get(f'/api/workspaces/{workspace.id}/history/')
+        request.user = user
+
+        view = WorkspaceHistoryListView.as_view()
+        response = view(request, workspace_id=workspace.id)
+
+        assert response.status_code == 503
+
+    @patch('apps.workspaces.views.get_channel_layer')
+    @patch('apps.workspaces.views.redis.Redis')
+    def test_get_history_timeout(self, mock_redis, mock_channel_layer, factory, user):
+        """Test getting history when workspace client times out."""
+        workspace = Workspace.objects.create(
+            owner=user,
+            name='Test Workspace',
+            status='running',
+        )
+
+        # Mock channel layer
+        mock_layer = MagicMock()
+        mock_channel_layer.return_value = mock_layer
+
+        # Mock Redis - simulate timeout (pending never changes)
+        mock_r = MagicMock()
+        mock_r.get.return_value = 'pending'
+        mock_redis.return_value = mock_r
+
+        from apps.workspaces.views import WorkspaceHistoryListView
+        request = factory.get(f'/api/workspaces/{workspace.id}/history/')
+        request.user = user
+
+        view = WorkspaceHistoryListView.as_view()
+        response = view(request, workspace_id=workspace.id)
+
+        assert response.status_code == 503
+        assert 'timeout' in response.data.get('error', '').lower() or 'offline' in response.data.get('error', '').lower()

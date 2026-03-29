@@ -108,20 +108,20 @@ function handleChildSelect(path: string) {
 .node-row {
   display: flex;
   align-items: center;
-  padding: 4px 8px;
+  padding: 6px 8px;
   cursor: pointer;
-  border-radius: 4px;
+  border-radius: 6px;
   transition: background 0.15s;
 }
 
 .node-row:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: #f5f5f7;
 }
 
 .expand-arrow {
   width: 16px;
   font-size: 10px;
-  color: rgba(255, 255, 255, 0.5);
+  color: #86868b;
 }
 
 .expand-arrow.placeholder {
@@ -139,11 +139,12 @@ function handleChildSelect(path: string) {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  color: #1d1d1f;
 }
 
 .node-size {
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.5);
+  color: #86868b;
   margin-left: 8px;
 }
 

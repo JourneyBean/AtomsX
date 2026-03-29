@@ -3,6 +3,23 @@ import { ref } from 'vue'
 import type { Session, Message } from '@/types'
 import { useNotificationStore } from '@/stores/notification'
 
+// File operation tool names that should trigger file tree refresh
+const FILE_OPERATION_TOOLS = [
+  'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep',
+  'NotebookEdit', 'mcp__*', // MCP tools might involve file operations
+]
+
+// Callback for file operation events
+let fileOperationCallback: (() => void) | null = null
+
+export function onFileOperation(callback: () => void) {
+  fileOperationCallback = callback
+}
+
+export function offFileOperation() {
+  fileOperationCallback = null
+}
+
 export const useSessionStore = defineStore('session', () => {
   const currentSession = ref<Session | null>(null)
   const messages = ref<Message[]>([])
@@ -118,6 +135,68 @@ export const useSessionStore = defineStore('session', () => {
     connectToStream(sessionId, agentMessage, taskId)
   }
 
+  async function resumeSession(historySessionId: string, content: string): Promise<boolean> {
+    if (!currentSession.value || isStreaming.value) {
+      return false
+    }
+
+    // Add user message locally
+    const userMessage: Message = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content,
+      timestamp: new Date().toISOString(),
+      status: 'complete',
+    }
+    messages.value.push(userMessage)
+
+    // Create placeholder for agent response
+    const agentMessage: Message = {
+      id: crypto.randomUUID(),
+      role: 'agent',
+      content: '',
+      timestamp: new Date().toISOString(),
+      status: 'streaming',
+    }
+    messages.value.push(agentMessage)
+
+    isStreaming.value = true
+
+    try {
+      const response = await fetch(`/api/sessions/${currentSession.value.id}/resume/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          history_session_id: historySessionId,
+          content,
+        }),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        // Connect to SSE stream for response
+        const sessionId = currentSession.value.id
+        connectToStream(sessionId, agentMessage)
+        return true
+      } else {
+        const notificationStore = useNotificationStore()
+        notificationStore.showError('Failed to resume session')
+        agentMessage.status = 'error'
+        agentMessage.content = 'Failed to resume session'
+        closeStream()
+        return false
+      }
+    } catch {
+      const notificationStore = useNotificationStore()
+      notificationStore.showError('Failed to resume session')
+      agentMessage.status = 'error'
+      agentMessage.content = 'Failed to resume session'
+      closeStream()
+      return false
+    }
+  }
+
   function connectToStream(sessionId: string, agentMessage: Message, _taskId?: string) {
     // Close existing connection
     if (eventSource.value) {
@@ -157,6 +236,17 @@ export const useSessionStore = defineStore('session', () => {
             agentMessage.content += data.content
           } else if (data.type === 'tool_use') {
             console.log('Tool use:', data.tool_name, data.tool_input)
+            // Check if this is a file operation tool
+            const isFileOperation = FILE_OPERATION_TOOLS.some(tool => {
+              if (tool.endsWith('*')) {
+                return data.tool_name.startsWith(tool.slice(0, -1))
+              }
+              return data.tool_name === tool
+            })
+            if (isFileOperation && fileOperationCallback) {
+              // Delay refresh slightly to allow file operation to complete
+              setTimeout(() => fileOperationCallback!(), 500)
+            }
           } else if (data.type === 'done') {
             agentMessage.status = 'complete'
             if (data.response) {
@@ -262,6 +352,7 @@ export const useSessionStore = defineStore('session', () => {
     startSession,
     loadSession,
     sendMessage,
+    resumeSession,
     interrupt,
     closeStream,
     clearSession,

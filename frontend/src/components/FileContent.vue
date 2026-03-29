@@ -21,7 +21,7 @@ const editorOptions = {
   scrollBeyondLastLine: false,
   fontSize: 13,
   lineNumbers: 'on',
-  theme: 'vs-dark',
+  theme: 'vs',
   automaticLayout: true,
   wordWrap: 'on',
 }
@@ -131,8 +131,8 @@ function handleEditorMount(editor: any, monaco: any) {
   display: flex;
   flex-direction: column;
   height: 100%;
-  background: #1e1e1e;
-  color: #fff;
+  background: #fff;
+  color: #1d1d1f;
 }
 
 .empty-state,
@@ -141,7 +141,8 @@ function handleEditorMount(editor: any, monaco: any) {
   justify-content: center;
   align-items: center;
   height: 100%;
-  color: rgba(255, 255, 255, 0.5);
+  color: #86868b;
+  background: #fafafa;
 }
 
 .content-area {
@@ -170,13 +171,15 @@ function handleEditorMount(editor: any, monaco: any) {
   justify-content: center;
   padding: 24px;
   overflow: auto;
+  background: #fafafa;
 }
 
 .preview-image {
   max-width: 100%;
   max-height: calc(100% - 40px);
   object-fit: contain;
-  border-radius: 4px;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
 }
 
 .image-info {
@@ -184,7 +187,7 @@ function handleEditorMount(editor: any, monaco: any) {
   gap: 16px;
   margin-top: 12px;
   font-size: 12px;
-  color: rgba(255, 255, 255, 0.6);
+  color: #86868b;
 }
 
 /* Message containers */
@@ -195,6 +198,7 @@ function handleEditorMount(editor: any, monaco: any) {
   align-items: center;
   justify-content: center;
   padding: 24px;
+  background: #fafafa;
 }
 
 .message-icon {
@@ -210,11 +214,12 @@ function handleEditorMount(editor: any, monaco: any) {
   font-size: 16px;
   font-weight: 500;
   margin-bottom: 8px;
+  color: #1d1d1f;
 }
 
 .message-detail {
   font-size: 14px;
-  color: rgba(255, 255, 255, 0.6);
+  color: #86868b;
 }
 
 .download-btn {

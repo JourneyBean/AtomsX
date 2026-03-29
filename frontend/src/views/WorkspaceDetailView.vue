@@ -2,9 +2,10 @@
 import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
+import { onFileOperation, offFileOperation } from '@/stores/session'
 import { useNotificationStore } from '@/stores/notification'
 import CodeView from '@/components/CodeView.vue'
-import type { Workspace } from '@/types'
+import type { Workspace, HistorySession } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -17,12 +18,64 @@ const currentTaskId = ref<string | undefined>()
 const workspaceId = route.params.id as string
 
 // Tab state: 'preview' or 'code'
-const activeTab = ref<'preview' | 'code'>('preview')
+const activeTab = ref<'preview' | 'code'>('code')
 
 // Preview availability state
 const previewReady = ref<boolean | null>(null) // null = not checked yet
 const previewError = ref<string>('')
 const checkingPreview = ref(false)
+
+// History state
+const historySessions = ref<HistorySession[]>([])
+const loadingHistory = ref(false)
+const historyError = ref<string>('')
+const isOffline = ref(false)
+const isComposing = ref(false) // IME composition state
+const currentHistorySessionId = ref<string | undefined>() // Track resumed session for sending new messages
+
+// File tree refresh trigger
+const fileRefreshTrigger = ref(0)
+
+// Panel widths for resizable layout
+const leftPanelWidth = ref(600)
+const historyWidth = ref(180)
+const isDraggingLeftPanel = ref(false)
+const isDraggingHistory = ref(false)
+
+// Resize handlers
+function startDragLeftPanel(e: MouseEvent) {
+  isDraggingLeftPanel.value = true
+  e.preventDefault()
+}
+
+function startDragHistory(e: MouseEvent) {
+  isDraggingHistory.value = true
+  e.preventDefault()
+}
+
+function handleMouseMove(e: MouseEvent) {
+  const container = document.querySelector('.content')
+  if (!container) return
+  const rect = container.getBoundingClientRect()
+
+  if (isDraggingLeftPanel.value) {
+    const newWidth = e.clientX - rect.left
+    leftPanelWidth.value = Math.max(400, Math.min(1000, newWidth))
+  }
+
+  if (isDraggingHistory.value) {
+    const leftPanel = document.querySelector('.left-panel')
+    if (!leftPanel) return
+    const leftRect = leftPanel.getBoundingClientRect()
+    const newWidth = e.clientX - leftRect.left
+    historyWidth.value = Math.max(120, Math.min(350, newWidth))
+  }
+}
+
+function handleMouseUp() {
+  isDraggingLeftPanel.value = false
+  isDraggingHistory.value = false
+}
 
 const previewUrl = computed(() => {
   const baseUrl = workspace.value?.preview_url || ''
@@ -36,17 +89,35 @@ const previewUrl = computed(() => {
   return baseUrl
 })
 
+// Computed status display
+const displayStatus = computed(() => {
+  if (isOffline.value) return 'offline'
+  return workspace.value?.status || 'loading'
+})
+
 onMounted(async () => {
   await fetchWorkspace()
   await sessionStore.startSession(workspaceId)
-  // Check preview availability if workspace is running and preview tab is active
-  if (workspace.value?.status === 'running' && activeTab.value === 'preview') {
-    checkPreviewAvailability()
-  }
+  await fetchHistoryList()
+  // Preview availability is checked when user switches to preview tab
+
+  // Set up file operation callback for auto-refresh
+  onFileOperation(() => {
+    fileRefreshTrigger.value++
+  })
+
+  // Add resize event listeners
+  window.addEventListener('mousemove', handleMouseMove)
+  window.addEventListener('mouseup', handleMouseUp)
 })
 
 onUnmounted(() => {
   sessionStore.clearSession()
+  offFileOperation()
+
+  // Remove resize event listeners
+  window.removeEventListener('mousemove', handleMouseMove)
+  window.removeEventListener('mouseup', handleMouseUp)
 })
 
 async function checkPreviewAvailability() {
@@ -108,7 +179,29 @@ async function sendMessage() {
   const content = newMessage.value
   newMessage.value = ''
 
-  await sessionStore.sendMessage(content)
+  // Check if we're in a resumed session
+  if (currentHistorySessionId.value) {
+    // Save current history messages before starting session
+    const historyMessages = [...sessionStore.messages]
+
+    // Need to start a session first if not already started
+    if (!sessionStore.currentSession) {
+      await sessionStore.startSession(workspaceId)
+      // Restore history messages after session started
+      sessionStore.messages = historyMessages
+    }
+
+    // Resume the session with the new message
+    await sessionStore.resumeSession(currentHistorySessionId.value, content)
+    currentHistorySessionId.value = undefined // Clear after sending
+    // Refresh history list after message sent
+    await fetchHistoryList()
+  } else {
+    // Normal new session message
+    await sessionStore.sendMessage(content)
+    // Refresh history list after message sent
+    await fetchHistoryList()
+  }
 }
 
 async function handleInterrupt() {
@@ -141,6 +234,98 @@ function onIframeError() {
   previewReady.value = false
   previewError.value = 'Preview failed to load. The workspace preview server may not be ready.'
 }
+
+// History functions
+async function fetchHistoryList() {
+  if (workspace.value?.status !== 'running') return
+
+  loadingHistory.value = true
+  historyError.value = ''
+
+  try {
+    const response = await fetch(`/api/workspaces/${workspaceId}/history/`, {
+      credentials: 'include',
+    })
+
+    if (response.ok) {
+      const data = await response.json()
+      historySessions.value = data.sessions || []
+      isOffline.value = false
+    } else if (response.status === 503) {
+      isOffline.value = true
+      historyError.value = 'Workspace client offline'
+    } else {
+      historyError.value = 'Failed to load history'
+    }
+  } catch {
+    historyError.value = 'Failed to load history'
+  } finally {
+    loadingHistory.value = false
+  }
+}
+
+async function startNewConversation() {
+  // Clear current session and history session ID, start fresh
+  currentHistorySessionId.value = undefined
+  sessionStore.clearSession()
+  await sessionStore.startSession(workspaceId)
+}
+
+async function resumeHistory(historySession: HistorySession) {
+  if (sessionStore.isStreaming) return
+
+  // Clear current messages first
+  sessionStore.clearSession()
+
+  // Track the history session ID for sending new messages later
+  currentHistorySessionId.value = historySession.history_session_id
+
+  // Fetch messages from this history session (NOT calling Claude SDK)
+  try {
+    const response = await fetch(
+      `/api/workspaces/${workspaceId}/history/${historySession.history_session_id}/`,
+      { credentials: 'include' }
+    )
+
+    if (response.ok) {
+      const data = await response.json()
+      // Display the messages in chat panel
+      sessionStore.messages = data.messages || []
+      isOffline.value = false
+    } else if (response.status === 503) {
+      isOffline.value = true
+      notificationStore.showError('Workspace client offline')
+    } else {
+      notificationStore.showError('Failed to load history messages')
+    }
+  } catch {
+    notificationStore.showError('Failed to load history messages')
+  }
+}
+
+function formatRelativeTime(timestamp: string): string {
+  if (!timestamp) return ''
+
+  const date = new Date(timestamp)
+  const now = new Date()
+  const diffMs = now.getTime() - date.getTime()
+  const diffMins = Math.floor(diffMs / 60000)
+  const diffHours = Math.floor(diffMins / 60)
+  const diffDays = Math.floor(diffHours / 24)
+
+  if (diffMins < 1) return '刚刚'
+  if (diffMins < 60) return `${diffMins}分钟前`
+  if (diffHours < 24) return `${diffHours}小时前`
+  if (diffDays < 7) return `${diffDays}天前`
+
+  return date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })
+}
+
+function handleKeyDown(event: KeyboardEvent) {
+  if (event.key === 'Enter' && !isComposing.value) {
+    sendMessage()
+  }
+}
 </script>
 
 <template>
@@ -148,55 +333,99 @@ function onIframeError() {
     <header class="header">
       <button @click="goBack" class="back-btn">← Back</button>
       <h1>{{ workspace?.name || 'Loading...' }}</h1>
-      <span class="status" :class="workspace?.status">{{ workspace?.status }}</span>
+      <span class="status" :class="displayStatus">{{ displayStatus }}</span>
     </header>
 
     <div class="content">
-      <!-- Left panel: Chat -->
-      <div class="chat-panel">
-        <div class="messages">
-          <div
-            v-for="(msg, idx) in sessionStore.messages"
-            :key="idx"
-            :class="['message', msg.role]"
-          >
-            <div class="message-header">
-              <span class="role">{{ msg.role === 'user' ? 'You' : 'Agent' }}</span>
-              <span class="status" v-if="msg.status !== 'complete'">{{ msg.status }}</span>
+      <!-- Left panel: History + Chat combined -->
+      <div class="left-panel" :style="{ width: leftPanelWidth + 'px' }">
+        <!-- History sidebar -->
+        <div class="history-sidebar" :style="{ width: historyWidth + 'px' }">
+          <button @click="startNewConversation" class="new-chat-btn">
+            + 新对话
+          </button>
+
+          <div class="history-list">
+            <div v-if="loadingHistory" class="history-loading">
+              加载中...
             </div>
-            <div class="message-content">{{ msg.content }}</div>
+            <div v-else-if="isOffline" class="history-error">
+              <span>离线状态</span>
+              <button @click="fetchHistoryList" class="retry-history-btn">重试</button>
+            </div>
+            <div v-else-if="historyError" class="history-error">
+              {{ historyError }}
+            </div>
+            <div v-else-if="historySessions.length === 0" class="history-empty">
+              暂无历史对话
+            </div>
+            <div
+              v-else
+              v-for="session in historySessions"
+              :key="session.history_session_id"
+              class="history-item"
+              @click="resumeHistory(session)"
+            >
+              <div class="history-title">{{ session.first_message || '无标题' }}</div>
+              <div class="history-time">{{ formatRelativeTime(session.last_activity) }}</div>
+            </div>
           </div>
 
-          <div v-if="sessionStore.messages.length === 0" class="empty-messages">
-            Start a conversation with the Agent...
-          </div>
+          <!-- Internal resizer for history -->
+          <div class="history-resizer" @mousedown="startDragHistory"></div>
         </div>
 
-        <div class="input-section">
-          <input
-            v-model="newMessage"
-            placeholder="Type a message..."
-            class="message-input"
-            @keyup.enter="sendMessage"
-            :disabled="sessionStore.isStreaming"
-          />
-          <button
-            v-if="sessionStore.isStreaming"
-            @click="handleInterrupt"
-            class="interrupt-btn"
-          >
-            Stop
-          </button>
-          <button
-            v-else
-            @click="sendMessage"
-            class="send-btn"
-            :disabled="!newMessage.trim()"
-          >
-            Send
-          </button>
+        <!-- Chat panel -->
+        <div class="chat-panel">
+          <div class="messages">
+            <div
+              v-for="(msg, idx) in sessionStore.messages"
+              :key="idx"
+              :class="['message', msg.role]"
+            >
+              <div class="message-header">
+                <span class="role">{{ msg.role === 'user' ? 'You' : 'Agent' }}</span>
+                <span class="status" v-if="msg.status !== 'complete'">{{ msg.status }}</span>
+              </div>
+              <div class="message-content">{{ msg.content }}</div>
+            </div>
+
+            <div v-if="sessionStore.messages.length === 0" class="empty-messages">
+              Start a conversation with the Agent...
+            </div>
+          </div>
+
+          <div class="input-section">
+            <input
+              v-model="newMessage"
+              placeholder="Type a message..."
+              class="message-input"
+              @keydown="handleKeyDown"
+              @compositionstart="isComposing = true"
+              @compositionend="isComposing = false"
+              :disabled="sessionStore.isStreaming || isOffline"
+            />
+            <button
+              v-if="sessionStore.isStreaming"
+              @click="handleInterrupt"
+              class="interrupt-btn"
+            >
+              Stop
+            </button>
+            <button
+              v-else
+              @click="sendMessage"
+              class="send-btn"
+              :disabled="!newMessage.trim() || isOffline"
+            >
+              Send
+            </button>
+          </div>
         </div>
       </div>
+
+      <!-- Resizer between left panel and right panel -->
+      <div class="resizer" @mousedown="startDragLeftPanel"></div>
 
       <!-- Right panel: Preview/Code with Tabs -->
       <div class="right-panel">
@@ -252,7 +481,7 @@ function onIframeError() {
             <div v-if="workspace?.status !== 'running'" class="code-placeholder">
               <p>Workspace is {{ workspace?.status }}...</p>
             </div>
-            <CodeView v-else :workspace-id="workspaceId" />
+            <CodeView v-else :workspace-id="workspaceId" :refresh-trigger="fileRefreshTrigger" />
           </div>
         </div>
       </div>
@@ -265,90 +494,234 @@ function onIframeError() {
   height: 100vh;
   display: flex;
   flex-direction: column;
-  background: #1a1a2e;
-  color: #fff;
+  background: #f5f5f7;
+  color: #1d1d1f;
+  padding: 12px;
+  gap: 12px;
 }
 
 .header {
   display: flex;
   align-items: center;
   gap: 16px;
-  padding: 16px 24px;
-  background: rgba(255, 255, 255, 0.05);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 12px 20px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
 .back-btn {
   background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  color: #fff;
+  border: 1px solid #d2d2d7;
+  color: #1d1d1f;
   padding: 8px 16px;
-  border-radius: 4px;
+  border-radius: 8px;
   cursor: pointer;
+  transition: all 0.15s;
+}
+
+.back-btn:hover {
+  background: #f5f5f7;
+  border-color: #86868b;
 }
 
 .header h1 {
-  font-size: 1.25rem;
+  font-size: 1.15rem;
+  font-weight: 600;
   flex: 1;
 }
 
 .status {
   padding: 4px 12px;
   border-radius: 12px;
-  font-size: 0.85rem;
+  font-size: 0.8rem;
+  font-weight: 500;
 }
 
 .status.running {
-  background: rgba(34, 197, 94, 0.2);
-  color: #22c55e;
+  background: #d1fae5;
+  color: #059669;
 }
 
 .status.creating {
-  background: rgba(234, 179, 8, 0.2);
-  color: #eab308;
+  background: #fef3c7;
+  color: #d97706;
 }
 
 .status.error {
-  background: rgba(239, 68, 68, 0.2);
-  color: #ef4444;
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+.status.offline {
+  background: #f3f4f6;
+  color: #6b7280;
 }
 
 .content {
   flex: 1;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  overflow: hidden;
   gap: 0;
+}
+
+/* Left panel: History + Chat combined */
+.left-panel {
+  display: flex;
+  flex-shrink: 0;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
   overflow: hidden;
 }
 
+/* Main resizer between left and right panels */
+.resizer {
+  width: 4px;
+  background: transparent;
+  cursor: col-resize;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+
+.resizer:hover {
+  background: #4f46e5;
+}
+
+/* History Sidebar (inside left panel) */
+.history-sidebar {
+  display: flex;
+  flex-direction: column;
+  background: #fafafa;
+  overflow: hidden;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.history-resizer {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 0.15s;
+}
+
+.history-resizer:hover {
+  background: #4f46e5;
+}
+
+.new-chat-btn {
+  margin: 12px;
+  padding: 10px 16px;
+  background: #4f46e5;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 500;
+  font-size: 0.9rem;
+  transition: background 0.15s;
+}
+
+.new-chat-btn:hover {
+  background: #4338ca;
+}
+
+.history-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.history-loading,
+.history-error,
+.history-empty {
+  text-align: center;
+  padding: 24px 12px;
+  color: #86868b;
+  font-size: 0.85rem;
+}
+
+.history-error {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.retry-history-btn {
+  padding: 6px 12px;
+  background: #f5f5f7;
+  color: #1d1d1f;
+  border: 1px solid #d2d2d7;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.retry-history-btn:hover {
+  background: #e8e8ed;
+}
+
+.history-item {
+  padding: 10px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s;
+  margin-bottom: 4px;
+}
+
+.history-item:hover {
+  background: #f5f5f7;
+}
+
+.history-title {
+  font-size: 0.85rem;
+  color: #1d1d1f;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 4px;
+}
+
+.history-time {
+  font-size: 0.75rem;
+  color: #86868b;
+}
+
+/* Chat panel (inside left panel) */
 .chat-panel {
   display: flex;
   flex-direction: column;
-  border-right: 1px solid rgba(255, 255, 255, 0.1);
   overflow: hidden;
+  flex: 1;
+  min-width: 0;
 }
 
 .messages {
   flex: 1;
-  padding: 24px;
+  padding: 20px;
   overflow-y: auto;
   min-height: 0;
 }
 
 .message {
   margin-bottom: 16px;
-  padding: 12px;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.1);
+  padding: 12px 16px;
+  border-radius: 12px;
+  background: #f5f5f7;
 }
 
 .message.user {
-  background: rgba(79, 70, 229, 0.2);
+  background: #eef2ff;
   margin-left: 48px;
 }
 
 .message.agent {
   margin-right: 48px;
+  background: #f5f5f7;
 }
 
 .message-header {
@@ -359,61 +732,72 @@ function onIframeError() {
 }
 
 .role {
-  color: rgba(255, 255, 255, 0.7);
+  color: #86868b;
   font-weight: 500;
 }
 
 .message-header .status {
-  color: #f59e0b;
+  color: #d97706;
   background: transparent;
   padding: 0;
+  font-size: 0.8rem;
 }
 
 .message-content {
   white-space: pre-wrap;
   line-height: 1.5;
+  color: #1d1d1f;
 }
 
 .empty-messages {
   text-align: center;
-  color: rgba(255, 255, 255, 0.5);
+  color: #86868b;
   padding: 48px;
 }
 
 .input-section {
   display: flex;
   gap: 12px;
-  padding: 16px 24px;
-  background: rgba(255, 255, 255, 0.05);
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 16px 20px;
+  background: #fff;
+  border-top: 1px solid #e5e5ea;
+  border-radius: 0 0 12px 12px;
 }
 
 .message-input {
   flex: 1;
-  padding: 12px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  background: rgba(255, 255, 255, 0.1);
-  color: #fff;
+  padding: 12px 16px;
+  border-radius: 10px;
+  border: 1px solid #d2d2d7;
+  background: #f5f5f7;
+  color: #1d1d1f;
   font-size: 1rem;
+  transition: all 0.15s;
 }
 
 .message-input:focus {
   outline: none;
-  border-color: rgba(79, 70, 229, 0.5);
+  border-color: #4f46e5;
+  background: #fff;
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
 }
 
 .send-btn, .interrupt-btn {
   padding: 12px 24px;
-  border-radius: 8px;
+  border-radius: 10px;
   border: none;
   cursor: pointer;
   font-weight: 500;
+  transition: all 0.15s;
 }
 
 .send-btn {
   background: #4f46e5;
   color: white;
+}
+
+.send-btn:hover:not(:disabled) {
+  background: #4338ca;
 }
 
 .send-btn:disabled {
@@ -422,42 +806,54 @@ function onIframeError() {
 }
 
 .interrupt-btn {
-  background: #dc2626;
-  color: white;
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+.interrupt-btn:hover {
+  background: #fecaca;
 }
 
 /* Right panel with tabs */
 .right-panel {
   display: flex;
   flex-direction: column;
-  background: #0f0f1a;
+  background: #fff;
+  flex: 1;
+  min-width: 0;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  overflow: hidden;
 }
 
 .tab-header {
   display: flex;
-  padding: 8px 16px;
-  background: rgba(255, 255, 255, 0.05);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 8px 12px;
+  background: #fff;
+  border-bottom: 1px solid #e5e5ea;
+  gap: 4px;
 }
 
 .tab-btn {
   padding: 8px 16px;
   background: transparent;
   border: none;
-  color: rgba(255, 255, 255, 0.6);
+  color: #86868b;
   font-size: 0.9rem;
   cursor: pointer;
-  border-radius: 4px;
+  border-radius: 6px;
   transition: all 0.15s;
 }
 
 .tab-btn:hover {
-  color: rgba(255, 255, 255, 0.9);
+  color: #1d1d1f;
+  background: #f5f5f7;
 }
 
 .tab-btn.active {
-  color: #fff;
-  background: rgba(79, 70, 229, 0.3);
+  color: #4f46e5;
+  background: #eef2ff;
+  font-weight: 500;
 }
 
 .tab-content {
@@ -476,7 +872,8 @@ function onIframeError() {
   display: flex;
   justify-content: center;
   align-items: center;
-  color: rgba(255, 255, 255, 0.5);
+  color: #86868b;
+  background: #fafafa;
 }
 
 .preview-frame {
@@ -498,19 +895,19 @@ function onIframeError() {
 }
 
 .error-title {
-  color: #f59e0b;
-  font-size: 1.25rem;
+  color: #d97706;
+  font-size: 1.1rem;
   font-weight: 600;
   margin-bottom: 8px;
 }
 
 .error-message {
-  color: rgba(255, 255, 255, 0.7);
+  color: #515154;
   margin-bottom: 12px;
 }
 
 .error-hint {
-  color: rgba(255, 255, 255, 0.5);
+  color: #86868b;
   font-size: 0.85rem;
   margin-bottom: 16px;
 }
@@ -520,7 +917,7 @@ function onIframeError() {
   background: #4f46e5;
   color: white;
   border: none;
-  border-radius: 6px;
+  border-radius: 8px;
   cursor: pointer;
   font-weight: 500;
   transition: background 0.15s;

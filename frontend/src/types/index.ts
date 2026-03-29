@@ -51,5 +51,11 @@ export interface Notification {
   timestamp: number
 }
 
+export interface HistorySession {
+  history_session_id: string
+  first_message: string
+  last_activity: string
+}
+
 // File Browser Types
 export * from './file'

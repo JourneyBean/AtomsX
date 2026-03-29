@@ -200,6 +200,39 @@ class WorkspaceConsumer(AsyncWebsocketConsumer):
                 # Heartbeat request - respond with pong
                 await self.send(json.dumps({'type': 'pong'}))
 
+            elif msg_type == 'history_list':
+                # History list response from Workspace Client
+                request_id = data.get('request_id')
+                sessions = data.get('sessions', [])
+                logger.info(f'Received history list: request_id={request_id}, sessions={len(sessions)}')
+
+                # Store response in Redis for waiting HTTP request
+                if request_id:
+                    r = get_redis_client()
+                    r.set(
+                        f'history_request:{request_id}',
+                        json.dumps(sessions),
+                        ex=10,  # Expire in 10 seconds
+                    )
+                    r.close()
+
+            elif msg_type == 'history_messages':
+                # History messages response from Workspace Client
+                request_id = data.get('request_id')
+                messages = data.get('messages', [])
+                history_session_id = data.get('history_session_id')
+                logger.info(f'Received history messages: request_id={request_id}, history_session_id={history_session_id}, messages={len(messages)}')
+
+                # Store response in Redis for waiting HTTP request
+                if request_id:
+                    r = get_redis_client()
+                    r.set(
+                        f'history_messages_request:{request_id}',
+                        json.dumps({'messages': messages, 'history_session_id': history_session_id}),
+                        ex=10,  # Expire in 10 seconds
+                    )
+                    r.close()
+
             else:
                 logger.warning(f'Unknown message type: {msg_type}')
 
@@ -251,6 +284,21 @@ class WorkspaceConsumer(AsyncWebsocketConsumer):
         await self.send(json.dumps({
             'type': 'ping',
             'timestamp': event.get('timestamp'),
+        }))
+
+    async def history_message(self, event):
+        """Handle history request message from Backend."""
+        await self.send(json.dumps({
+            'type': 'get_history',
+            'request_id': event.get('request_id'),
+        }))
+
+    async def history_messages_message(self, event):
+        """Handle history messages request message from Backend."""
+        await self.send(json.dumps({
+            'type': 'get_history_messages',
+            'request_id': event.get('request_id'),
+            'history_session_id': event.get('history_session_id'),
         }))
 
     @database_sync_to_async
@@ -344,5 +392,37 @@ async def send_user_input_to_workspace(
             'session_id': session_id,
             'request_id': request_id,
             'input': input_data,
+        }
+    )
+
+
+async def send_get_history_to_workspace(
+    channel_layer,
+    workspace_id: str,
+    request_id: str
+):
+    """Send a get_history request to a Workspace Client."""
+    await channel_layer.group_send(
+        f'workspace_{workspace_id}',
+        {
+            'type': 'history.message',
+            'request_id': request_id,
+        }
+    )
+
+
+async def send_get_history_messages_to_workspace(
+    channel_layer,
+    workspace_id: str,
+    request_id: str,
+    history_session_id: str
+):
+    """Send a get_history_messages request to a Workspace Client."""
+    await channel_layer.group_send(
+        f'workspace_{workspace_id}',
+        {
+            'type': 'history_messages.message',
+            'request_id': request_id,
+            'history_session_id': history_session_id,
         }
     )

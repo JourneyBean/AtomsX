@@ -141,6 +141,12 @@ class WorkspaceClient:
             elif message_type == "user_input":
                 await self._handle_user_input(message)
 
+            elif message_type == "get_history":
+                await self._handle_get_history(message)
+
+            elif message_type == "get_history_messages":
+                await self._handle_get_history_messages(message)
+
             elif message_type == "ping":
                 # Ping handled by client, just respond with pong
                 await self.ws_client.send({"type": "pong"})
@@ -319,6 +325,86 @@ class WorkspaceClient:
         except Exception as e:
             logger.error(f"User input handling error: {e}")
             await self._send_error(session_id, str(e))
+
+    async def _handle_get_history(self, message: dict):
+        """
+        Handle get_history message - return list of history sessions.
+
+        Args:
+            message: Get history message with optional request_id
+        """
+        request_id = message.get("request_id")
+
+        try:
+            # Get history list from session manager
+            sessions = self.session_manager.get_history_list()
+
+            # Send response
+            response = {
+                "type": "history_list",
+                "sessions": sessions,
+            }
+            if request_id:
+                response["request_id"] = request_id
+
+            await self.ws_client.send(response)
+            logger.info(f"Sent history list with {len(sessions)} sessions")
+
+        except Exception as e:
+            logger.error(f"Get history error: {e}")
+            error_response = {
+                "type": "error",
+                "error": str(e),
+            }
+            if request_id:
+                error_response["request_id"] = request_id
+            await self.ws_client.send(error_response)
+
+    async def _handle_get_history_messages(self, message: dict):
+        """
+        Handle get_history_messages message - return messages from a history session.
+
+        Args:
+            message: Get history messages message with history_session_id and request_id
+        """
+        request_id = message.get("request_id")
+        history_session_id = message.get("history_session_id")
+
+        if not history_session_id:
+            error_response = {
+                "type": "error",
+                "error": "Missing history_session_id",
+            }
+            if request_id:
+                error_response["request_id"] = request_id
+            await self.ws_client.send(error_response)
+            return
+
+        try:
+            # Get messages from session manager
+            messages = self.session_manager.get_history_messages(history_session_id)
+
+            # Send response
+            response = {
+                "type": "history_messages",
+                "history_session_id": history_session_id,
+                "messages": messages,
+            }
+            if request_id:
+                response["request_id"] = request_id
+
+            await self.ws_client.send(response)
+            logger.info(f"Sent {len(messages)} messages for history {history_session_id}")
+
+        except Exception as e:
+            logger.error(f"Get history messages error: {e}")
+            error_response = {
+                "type": "error",
+                "error": str(e),
+            }
+            if request_id:
+                error_response["request_id"] = request_id
+            await self.ws_client.send(error_response)
 
     async def _send_stream_event(self, event: dict):
         """

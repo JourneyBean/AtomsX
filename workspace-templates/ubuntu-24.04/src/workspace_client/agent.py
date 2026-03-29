@@ -30,6 +30,29 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 
+# Environment context for Claude Agent
+# This informs Claude about the container environment and correct path usage
+ENV_CONTEXT = """
+## 环境信息
+
+你正在 Docker 容器中运行，以下是你的运行环境：
+
+### 工作目录
+- **代码工作目录**: /home/user/workspace
+- 所有文件操作（读取、写入、编辑）都应该使用相对于此目录的路径，或使用以此目录为根的绝对路径
+- 示例：创建文件应使用 `/home/user/workspace/hello.py` 或 `hello.py`
+
+### 用户数据
+- **用户数据目录**: /home/user/data (如果存在)
+- 这是用户持久化数据的存储位置
+
+### 重要提示
+- 不要使用 `/Users/...` 或其他宿主机路径
+- 不要假设你在特定的开发环境中
+- 当前工作目录是你的工作空间根目录
+"""
+
+
 @dataclass
 class ActiveSession:
     """
@@ -47,6 +70,7 @@ class ActiveSession:
     history_session_id: Optional[str] = None  # Folder name in /home/user/history/
     client: Optional[ClaudeSDKClient] = None
     _client_context: Any = None  # Holds the async context manager
+    _history_context: Optional[str] = None  # Holds the conversation history for resume
     created_at: datetime = field(default_factory=datetime.utcnow)
     last_activity: datetime = field(default_factory=datetime.utcnow)
     is_active: bool = False
@@ -174,6 +198,12 @@ class SessionManager:
         options_kwargs = {
             "cwd": Path("/home/user/workspace"),
             "env": env_vars,  # Always pass a dict, even if empty
+            "permission_mode": "bypassPermissions",  # Allow all tool calls without user confirmation
+            "system_prompt": {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": ENV_CONTEXT,
+            },
         }
 
         # Add model if configured
@@ -242,17 +272,47 @@ class SessionManager:
 
         logger.info(f"Claude SDK env config: {list(env_vars.keys())}")
 
-        # Configure Claude SDK client
-        options = ClaudeAgentOptions(
-            cwd=Path("/home/user/workspace"),
-            env=env_vars,  # Always pass a dict, even if empty
-        )
+        # Configure Claude SDK client options
+        options_kwargs = {
+            "cwd": Path("/home/user/workspace"),
+            "env": env_vars,  # Always pass a dict, even if empty
+            "permission_mode": "bypassPermissions",  # Allow all tool calls without user confirmation
+            "system_prompt": {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": ENV_CONTEXT,
+            },
+        }
+
+        # Add model if configured
+        if config.get("anthropic_model"):
+            options_kwargs["model"] = config["anthropic_model"]
+            logger.info(f"Claude SDK model: {config['anthropic_model']}")
+
+        options = ClaudeAgentOptions(**options_kwargs)
 
         # Create and enter Claude SDK client context
         session.client = ClaudeSDKClient(options=options)
         session._client_context = session.client.__aenter__()
         await session._client_context
         session.is_active = True
+
+        # Load and replay history messages to restore context
+        history_messages = self.get_history_messages(history_session_id)
+        if history_messages:
+            logger.info(f"Replaying {len(history_messages)} history messages for context")
+            # Build a context string from history
+            context_parts = []
+            for msg in history_messages:
+                role = "User" if msg.get("role") == "user" else "Assistant"
+                content = msg.get("content", "")
+                context_parts.append(f"{role}: {content}")
+
+            # Store context for later use in send_message
+            session._history_context = "\n\n".join(context_parts)
+            logger.info(f"Stored history context ({len(session._history_context)} chars)")
+        else:
+            session._history_context = None
 
         self.sessions[session_id] = session
 
@@ -318,9 +378,24 @@ class SessionManager:
         session.pending_user_input = False
 
         try:
+            # Build the message with history context if available
+            full_message = message
+            if hasattr(session, '_history_context') and session._history_context:
+                # Prepend history context to the message
+                full_message = f"""<conversation_history>
+This is a continuation of a previous conversation. Here is the context:
+
+{session._history_context}
+</conversation_history>
+
+<new_message>
+{message}
+</new_message>"""
+                logger.info(f"Sending message with history context ({len(session._history_context)} chars)")
+
             # Send the query
             logger.info(f"Sending query to Claude SDK for session {session_id}...")
-            await session.client.query(message)
+            await session.client.query(full_message)
             logger.info(f"Query sent, waiting for response...")
 
             full_response = ""
@@ -492,3 +567,124 @@ class SessionManager:
             await self.close_session(session_id)
 
         logger.info("All sessions cleaned up")
+
+    def get_history_list(self) -> list[dict]:
+        """
+        Get list of all history sessions.
+
+        Returns:
+            List of session metadata dicts, sorted by last_activity descending.
+            Each dict contains:
+            - history_session_id: str (folder name)
+            - first_message: str (truncated to 50 chars)
+            - last_activity: str (ISO timestamp)
+        """
+        sessions = []
+
+        # Check if history directory exists
+        if not self.history_dir.exists():
+            logger.info("History directory does not exist")
+            return sessions
+
+        try:
+            # List all subdirectories in history/
+            for item in sorted(self.history_dir.iterdir(), key=lambda x: x.name, reverse=True):
+                if not item.is_dir():
+                    continue
+
+                history_session_id = item.name
+
+                # Read session.json for metadata
+                session_file = item / "session.json"
+                if not session_file.exists():
+                    logger.warning(f"session.json not found in {history_session_id}")
+                    continue
+
+                try:
+                    with open(session_file) as f:
+                        session_data = json.load(f)
+                except (json.JSONDecodeError, IOError) as e:
+                    logger.warning(f"Failed to read session.json for {history_session_id}: {e}")
+                    continue
+
+                # Read first line of messages.jsonl for first user message
+                first_message = ""
+                messages_file = item / "messages.jsonl"
+                if messages_file.exists():
+                    try:
+                        with open(messages_file) as f:
+                            first_line = f.readline().strip()
+                            if first_line:
+                                msg_data = json.loads(first_line)
+                                first_message = msg_data.get("user", "")[:50]
+                    except (json.JSONDecodeError, IOError) as e:
+                        logger.warning(f"Failed to read messages.jsonl for {history_session_id}: {e}")
+
+                sessions.append({
+                    "history_session_id": history_session_id,
+                    "first_message": first_message,
+                    "last_activity": session_data.get("last_activity", ""),
+                })
+
+            # Sort by last_activity descending
+            sessions.sort(key=lambda x: x.get("last_activity", ""), reverse=True)
+
+            logger.info(f"Found {len(sessions)} history sessions")
+            return sessions
+
+        except Exception as e:
+            logger.error(f"Error listing history: {e}")
+            return sessions
+
+    def get_history_messages(self, history_session_id: str) -> list[dict]:
+        """
+        Get messages from a history session.
+
+        Args:
+            history_session_id: Folder name in history directory
+
+        Returns:
+            List of message dicts with role, content, timestamp
+        """
+        messages = []
+
+        messages_file = self.history_dir / history_session_id / "messages.jsonl"
+
+        if not messages_file.exists():
+            logger.warning(f"Messages file not found for {history_session_id}")
+            return messages
+
+        try:
+            with open(messages_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        msg_data = json.loads(line)
+                        # Add user message
+                        if msg_data.get("user"):
+                            messages.append({
+                                "role": "user",
+                                "content": msg_data["user"],
+                                "timestamp": msg_data.get("timestamp", ""),
+                                "status": "complete",
+                            })
+                        # Add assistant message
+                        if msg_data.get("assistant"):
+                            messages.append({
+                                "role": "agent",
+                                "content": msg_data["assistant"],
+                                "timestamp": msg_data.get("timestamp", ""),
+                                "status": "complete",
+                            })
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Failed to parse message line: {e}")
+
+            logger.info(f"Loaded {len(messages)} messages from {history_session_id}")
+            return messages
+
+        except Exception as e:
+            logger.error(f"Error reading messages from {history_session_id}: {e}")
+            return messages
