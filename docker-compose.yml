@@ -101,6 +101,13 @@ services:
       DOCKER_HOST: ${DOCKER_HOST:-unix:///var/run/dind/docker.sock}
       WORKSPACE_NETWORK_NAME: ${WORKSPACE_NETWORK_NAME:-atomsx-workspaces}
       WORKSPACE_BASE_IMAGE: ${WORKSPACE_BASE_IMAGE:-atomsx-workspace:latest}
+      # Domain configuration
+      ATOMSX_PREVIEW_DOMAIN: ${ATOMSX_PREVIEW_DOMAIN:-preview.local}
+      ATOMSX_DEPLOY_DOMAIN: ${ATOMSX_DEPLOY_DOMAIN:-apps.local}
+      # Anthropic API configuration
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
     volumes:
       - ./backend:/app
       - dind_socket:/var/run/dind:ro
@@ -151,6 +158,13 @@ services:
       DOCKER_HOST: ${DOCKER_HOST:-unix:///var/run/dind/docker.sock}
       WORKSPACE_NETWORK_NAME: ${WORKSPACE_NETWORK_NAME:-atomsx-workspaces}
       WORKSPACE_BASE_IMAGE: ${WORKSPACE_BASE_IMAGE:-atomsx-workspace:latest}
+      # Domain configuration
+      ATOMSX_PREVIEW_DOMAIN: ${ATOMSX_PREVIEW_DOMAIN:-preview.local}
+      ATOMSX_DEPLOY_DOMAIN: ${ATOMSX_DEPLOY_DOMAIN:-apps.local}
+      # Anthropic API configuration
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
     volumes:
       - ./backend:/app
       - dind_socket:/var/run/dind:ro
@@ -193,10 +207,12 @@ services:
   # OpenResty Gateway
   # ===========================================================================
   gateway:
-    image: openresty/openresty:alpine
-    volumes:
-      - ./gateway/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
-      - ./gateway/lua:/usr/local/openresty/lua:ro
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    environment:
+      ATOMSX_PREVIEW_DOMAIN: ${ATOMSX_PREVIEW_DOMAIN:-preview.local}
+      ATOMSX_DEPLOY_DOMAIN: ${ATOMSX_DEPLOY_DOMAIN:-apps.local}
     ports:
       - "80:80"
       - "443:443"

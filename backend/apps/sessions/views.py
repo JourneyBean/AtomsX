@@ -7,14 +7,18 @@ Provides REST API endpoints for Agent conversation:
 - GET /api/sessions/:id/stream/ - SSE streaming endpoint
 - POST /api/sessions/:id/messages/ - Send a message
 - POST /api/sessions/:id/interrupt/ - Interrupt current response
+- POST /api/sessions/:id/resume/ - Resume session with claude_session_id
 """
 import json
 import logging
 import redis
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
 from django.conf import settings
 from django.http import StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
+from django.views import View
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -22,8 +26,13 @@ from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
 
 from apps.workspaces.models import Workspace
+from apps.workspaces.consumers import (
+    send_task_to_workspace,
+    send_resume_to_workspace,
+    send_interrupt_to_workspace,
+)
 from .models import Session
-from .serializers import SessionSerializer, SendMessageSerializer
+from .serializers import SessionSerializer, SendMessageSerializer, ResumeSessionSerializer
 from .tasks import process_agent_message, interrupt_agent_task, get_redis_client
 from apps.core.models import create_audit_log
 
@@ -38,10 +47,20 @@ class SessionStartView(APIView):
 
     permission_classes = [IsAuthenticated]
 
-    def post(self, request, workspace_id):
+    def post(self, request):
         """
         Start a new session for a workspace.
+
+        workspace_id is passed as a query parameter: ?workspace_id=...
         """
+        # Get workspace_id from query params
+        workspace_id = request.GET.get('workspace_id')
+        if not workspace_id:
+            return Response(
+                {'error': 'workspace_id query parameter is required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # Get workspace and verify ownership
         workspace = get_object_or_404(Workspace, id=workspace_id)
 
@@ -99,12 +118,13 @@ class SessionDetailView(APIView):
 
 
 @method_decorator(csrf_exempt, name='dispatch')
-class SessionStreamView(APIView):
+class SessionStreamView(View):
     """
     SSE streaming endpoint for Agent responses.
-    """
 
-    permission_classes = [IsAuthenticated]
+    Uses Django View instead of DRF APIView to avoid content negotiation
+    issues with SSE (406 Not Acceptable).
+    """
 
     def get(self, request, session_id):
         """
@@ -113,14 +133,20 @@ class SessionStreamView(APIView):
         Connect to this endpoint to receive streaming responses.
         The client should keep the connection open to receive events.
         """
+        logger.info(f'SSE stream request: session_id={session_id}, user={request.user}, authenticated={request.user.is_authenticated}')
+
+        # Check authentication
+        if not request.user.is_authenticated:
+            from django.http import JsonResponse
+            logger.warning(f'SSE stream unauthorized: session_id={session_id}')
+            return JsonResponse({'error': 'Authentication required'}, status=401)
+
         session = get_object_or_404(Session, id=session_id)
 
         # Check ownership
         if session.user != request.user:
-            return Response(
-                {'error': 'Access denied'},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+            from django.http import JsonResponse
+            return JsonResponse({'error': 'Access denied'}, status=403)
 
         # Check if there's a message to process
         message_content = request.GET.get('message')
@@ -156,7 +182,6 @@ class SessionStreamView(APIView):
             headers={
                 'Cache-Control': 'no-cache',
                 'X-Accel-Buffering': 'no',
-                'Connection': 'keep-alive',
             },
         )
 
@@ -164,15 +189,18 @@ class SessionStreamView(APIView):
         """
         Generate SSE events from Redis pub/sub.
         """
+        # Convert UUID to string if needed
+        session_id_str = str(session_id)
+
         r = get_redis_client()
         pubsub = r.pubsub()
-        channel = f'session:{session_id}'
+        channel = f'session:{session_id_str}'
 
         try:
             pubsub.subscribe(channel)
 
-            # Send initial connection event
-            yield f'event: connected\ndata: {{"session_id": "{session_id}"}}\n\n'
+            # Send initial connection event (unnamed, so onmessage receives it)
+            yield f'data: {json.dumps({"type": "connected", "session_id": session_id_str})}\n\n'
 
             # Listen for events
             for message in pubsub.listen():
@@ -180,16 +208,17 @@ class SessionStreamView(APIView):
                     data = message['data']
                     event = json.loads(data)
 
-                    event_type = event.pop('type', 'message')
-                    yield f'event: {event_type}\ndata: {json.dumps(event)}\n\n'
+                    # Send as unnamed event (onmessage will receive it)
+                    yield f'data: {json.dumps(event)}\n\n'
 
                     # Stop streaming if done or error
+                    event_type = event.get('type')
                     if event_type in ('done', 'error', 'interrupted'):
                         break
 
         except GeneratorExit:
             # Client disconnected
-            logger.info(f'SSE client disconnected for session {session_id}')
+            logger.info(f'SSE client disconnected for session {session_id_str}')
 
         finally:
             pubsub.unsubscribe(channel)
@@ -208,6 +237,9 @@ class SessionMessageView(APIView):
     def post(self, request, session_id):
         """
         Send a message to the Agent and start streaming.
+
+        Uses WebSocket to communicate with Workspace Client if connected,
+        otherwise falls back to Celery task (deprecated).
         """
         session = get_object_or_404(Session, id=session_id)
 
@@ -246,18 +278,45 @@ class SessionMessageView(APIView):
             message_summary=message_content[:200],
         )
 
-        # Trigger async processing
-        task = process_agent_message.delay(
-            str(session.id),
-            agent_message['id'],
-            message_content,
-        )
+        # Check if workspace client is connected via WebSocket
+        channel_layer = get_channel_layer()
+        workspace_id = str(session.workspace_id)
 
-        return Response({
-            'message_id': agent_message['id'],
-            'task_id': task.id,
-            'stream_url': f'/api/sessions/{session_id}/stream/',
-        })
+        # Check for WebSocket connection by looking for active group members
+        # This is a heuristic - we assume if there's a group, client is connected
+        try:
+            # Send task via WebSocket to Workspace Client
+            async_to_sync(send_task_to_workspace)(
+                channel_layer,
+                workspace_id,
+                str(session.id),
+                message_content,
+            )
+
+            logger.info(f'Sent task to workspace client for session {session_id}')
+
+            return Response({
+                'message_id': agent_message['id'],
+                'stream_url': f'/api/sessions/{session_id}/stream/',
+                'transport': 'websocket',
+            })
+
+        except Exception as e:
+            # Fallback to Celery task if WebSocket fails
+            logger.warning(f'WebSocket send failed, falling back to Celery: {e}')
+
+            task = process_agent_message.delay(
+                str(session.id),
+                agent_message['id'],
+                message_content,
+            )
+
+            return Response({
+                'message_id': agent_message['id'],
+                'task_id': task.id,
+                'stream_url': f'/api/sessions/{session_id}/stream/',
+                'transport': 'celery',
+            })
 
 
 @method_decorator(csrf_exempt, name='dispatch')
@@ -271,6 +330,9 @@ class SessionInterruptView(APIView):
     def post(self, request, session_id):
         """
         Request an interrupt for the current Agent task.
+
+        Uses WebSocket to communicate with Workspace Client if connected,
+        otherwise falls back to Celery task.
         """
         session = get_object_or_404(Session, id=session_id)
 
@@ -281,18 +343,116 @@ class SessionInterruptView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        task_id = request.data.get('task_id')
+        # Send interrupt via WebSocket
+        channel_layer = get_channel_layer()
+        workspace_id = str(session.workspace_id)
 
-        if not task_id:
-            return Response(
-                {'error': 'task_id is required'},
-                status=status.HTTP_400_BAD_REQUEST,
+        try:
+            async_to_sync(send_interrupt_to_workspace)(
+                channel_layer,
+                workspace_id,
+                str(session_id),
             )
 
-        # Request interrupt
-        interrupt_agent_task.delay(task_id, str(session_id), '')
+            logger.info(f'Sent interrupt to workspace client for session {session_id}')
 
-        return Response({
-            'status': 'interrupt_requested',
-            'task_id': task_id,
-        })
+            return Response({
+                'status': 'interrupt_requested',
+                'transport': 'websocket',
+            })
+
+        except Exception as e:
+            # Fallback to Celery
+            logger.warning(f'WebSocket interrupt failed, falling back to Celery: {e}')
+
+            task_id = request.data.get('task_id')
+            if task_id:
+                interrupt_agent_task.delay(task_id, str(session_id), '')
+                return Response({
+                    'status': 'interrupt_requested',
+                    'task_id': task_id,
+                    'transport': 'celery',
+                })
+
+            return Response({
+                'error': 'WebSocket unavailable and no task_id provided',
+                'status': status.HTTP_400_BAD_REQUEST,
+            })
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class SessionResumeView(APIView):
+    """
+    Resume a session from history directory.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, session_id):
+        """
+        Resume an existing Claude session from history.
+
+        Reads history_session_id from request, then Workspace Client
+        loads the session from /home/user/history/{history_session_id}/.
+
+        The history directory structure is managed by Workspace Client,
+        not by Backend. Backend just passes the session ID to resume.
+        """
+        session = get_object_or_404(Session, id=session_id)
+
+        # Check ownership
+        if session.user != request.user:
+            return Response(
+                {'error': 'Access denied'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = ResumeSessionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        history_session_id = serializer.validated_data['history_session_id']
+        message_content = serializer.validated_data.get('content', '')
+
+        # Add user message if provided
+        if message_content:
+            user_message = session.add_message('user', message_content, 'complete')
+            agent_message = session.add_message('agent', '', 'streaming')
+
+            # Audit
+            create_audit_log(
+                event_type='MESSAGE_SENT',
+                user_id=request.user.id,
+                session_id=session.id,
+                workspace_id=session.workspace_id,
+                message_role='user',
+                message_summary=message_content[:200],
+            )
+
+        # Send resume via WebSocket
+        channel_layer = get_channel_layer()
+        workspace_id = str(session.workspace_id)
+
+        try:
+            async_to_sync(send_resume_to_workspace)(
+                channel_layer,
+                workspace_id,
+                str(session_id),
+                history_session_id,  # This is the history session folder name
+                message_content,
+            )
+
+            logger.info(f'Sent resume to workspace client for session {session_id}')
+
+            return Response({
+                'status': 'resume_requested',
+                'history_session_id': history_session_id,
+                'transport': 'websocket',
+            })
+
+        except Exception as e:
+            logger.error(f'WebSocket resume failed: {e}')
+
+            return Response(
+                {'error': 'WebSocket communication failed'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )

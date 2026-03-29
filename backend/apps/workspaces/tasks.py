@@ -1,12 +1,15 @@
 """
 Celery tasks for Workspace container management.
 """
+import os
 import logging
 import docker
 from django.conf import settings
 from celery import shared_task
-from .models import Workspace
-from .docker_utils import check_dind_health, DinDNotEnabledError, DinDHealthCheckError
+from celery.exceptions import SoftTimeLimitExceeded
+from .models import Workspace, WorkspaceToken
+from .docker_utils import check_dind_health, DinDNotEnabledError, DinDHealthCheckError, UserDataDirectoryError
+from .data_utils import compute_user_data_path, create_user_data_directory
 from apps.core.models import create_audit_log
 
 logger = logging.getLogger(__name__)
@@ -36,17 +39,26 @@ def get_docker_client():
     return client
 
 
-@shared_task(bind=True, max_retries=3, default_retry_delay=10)
+@shared_task(
+    bind=True,
+    max_retries=3,
+    default_retry_delay=10,
+    soft_time_limit=settings.WORKSPACE_CREATION_SOFT_TIMEOUT,
+    time_limit=settings.WORKSPACE_CREATION_HARD_TIMEOUT,
+)
 def create_workspace_container(self, workspace_id: str):
     """
     Create a Docker container for a workspace.
 
     This task:
-    1. Creates a Docker container with the workspace image
-    2. Sets up network isolation
-    3. Creates a volume for source files
-    4. Starts the container
-    5. Updates the workspace record with container info
+    1. Creates user data directory with UUID sharding
+    2. Creates a Docker container with the workspace image
+    3. Sets up network isolation
+    4. Mounts user data directory as /home/user
+    5. Starts the container
+    6. Updates the workspace record with container info
+
+    Timeout: Configurable via WORKSPACE_CREATION_SOFT_TIMEOUT and WORKSPACE_CREATION_HARD_TIMEOUT
     """
     try:
         workspace = Workspace.objects.get(id=workspace_id)
@@ -54,33 +66,95 @@ def create_workspace_container(self, workspace_id: str):
         logger.error(f'Workspace {workspace_id} not found')
         return
 
-    # Verify dind is healthy before proceeding
+    # Handle soft timeout exception
     try:
-        client = get_docker_client()
-    except DinDNotEnabledError as e:
-        logger.error(f'Dind not enabled: {e}')
-        workspace.transition_status('error', 'Docker-in-Docker not enabled')
-        workspace.save()
-        create_audit_log(
-            event_type='WORKSPACE_ERROR',
-            user_id=workspace.owner_id,
-            workspace_id=workspace.id,
-            error_message=f'Dind configuration error: {e}',
-        )
-        return  # Don't retry configuration errors
-    except DinDHealthCheckError as e:
-        logger.error(f'Dind health check failed: {e}')
-        workspace.transition_status('error', 'Docker daemon unavailable')
-        workspace.save()
-        create_audit_log(
-            event_type='WORKSPACE_ERROR',
-            user_id=workspace.owner_id,
-            workspace_id=workspace.id,
-            error_message=f'Dind connection error: {e}',
-        )
-        raise self.retry(exc=e)  # Retry for transient connection issues
+        # Step 1: Create user data directory first
+        data_dir_path = None
+        bind_mount_path = None
+        try:
+            # Compute data directory path (internal path for Celery worker)
+            data_dir_path = compute_user_data_path(str(workspace.id))
 
-    try:
+            # Compute bind mount path (host path for Docker)
+            # In dind mode, these are the same; in dev mode with host Docker socket, they differ
+            bind_mount_path = compute_user_data_path(
+                str(workspace.id),
+                root=settings.HOST_WORKSPACE_DATA_ROOT
+            )
+
+            # Check if directory already exists (reuse case)
+            if os.path.exists(data_dir_path):
+                logger.info(f'Data directory already exists for workspace {workspace_id}: {data_dir_path}')
+            else:
+                # Create directory structure
+                result = create_user_data_directory(data_dir_path)
+                logger.info(f'Created user data directory for workspace {workspace_id}: {data_dir_path}')
+
+            # Update workspace record with data directory path
+            workspace.data_dir_path = data_dir_path
+            workspace.save(update_fields=['data_dir_path'])
+
+        except PermissionError as e:
+            error_msg = f'Failed to create data directory: permission denied - {e}'
+            logger.error(error_msg)
+            workspace.transition_status('error', error_msg)
+            workspace.save()
+            create_audit_log(
+                event_type='WORKSPACE_ERROR',
+                user_id=workspace.owner_id,
+                workspace_id=workspace.id,
+                details={'data_dir_path': data_dir_path},
+                error_message=error_msg,
+            )
+            raise UserDataDirectoryError(error_msg, reason='permission_denied')
+
+        except OSError as e:
+            # Handle disk full and other OS errors
+            if 'No space left on device' in str(e) or e.errno == 28:  # ENOSPC
+                error_msg = 'Failed to create data directory: disk full'
+            else:
+                error_msg = f'Failed to create data directory: {e}'
+
+            logger.error(error_msg)
+            workspace.transition_status('error', error_msg)
+            workspace.save()
+            create_audit_log(
+                event_type='WORKSPACE_ERROR',
+                user_id=workspace.owner_id,
+                workspace_id=workspace.id,
+                details={'data_dir_path': data_dir_path},
+                error_message=error_msg,
+            )
+            raise UserDataDirectoryError(error_msg, reason='os_error')
+
+        # Step 2: Verify dind is healthy before proceeding
+        try:
+            client = get_docker_client()
+        except DinDNotEnabledError as e:
+            logger.error(f'Dind not enabled: {e}')
+            workspace.transition_status('error', 'Docker-in-Docker not enabled')
+            workspace.save()
+            create_audit_log(
+                event_type='WORKSPACE_ERROR',
+                user_id=workspace.owner_id,
+                workspace_id=workspace.id,
+                details={'data_dir_path': data_dir_path},
+                error_message=f'Dind configuration error: {e}',
+            )
+            return  # Don't retry configuration errors
+        except DinDHealthCheckError as e:
+            logger.error(f'Dind health check failed: {e}')
+            workspace.transition_status('error', 'Docker daemon unavailable')
+            workspace.save()
+            create_audit_log(
+                event_type='WORKSPACE_ERROR',
+                user_id=workspace.owner_id,
+                workspace_id=workspace.id,
+                details={'data_dir_path': data_dir_path},
+                error_message=f'Dind connection error: {e}',
+            )
+            raise self.retry(exc=e)  # Retry for transient connection issues
+
         # Get or create the workspace network
         network_name = settings.WORKSPACE_NETWORK_NAME
         try:
@@ -89,35 +163,44 @@ def create_workspace_container(self, workspace_id: str):
             network = client.networks.create(network_name, driver='bridge')
             logger.info(f'Created network: {network_name} in dind')
 
-        # Create volume for workspace files
-        volume_name = f'workspace-{workspace_id}'
-        try:
-            volume = client.volumes.get(volume_name)
-        except docker.errors.NotFound:
-            volume = client.volumes.create(volume_name)
-            logger.info(f'Created volume: {volume_name} in dind')
+        # Create auth token for Workspace Client WebSocket connection
+        workspace_token = WorkspaceToken.create_for_workspace(workspace)
+        logger.info(f'Created auth token for workspace {workspace_id}')
 
         # Container configuration
         container_name = f'workspace-{workspace_id}'
-        image = settings.WORKSPACE_BASE_IMAGE
+        base_image = settings.WORKSPACE_BASE_IMAGE
+        image_source = 'unknown'
 
-        # Check if image exists in dind, build if not
+        # Check if prebuilt image exists in dind
         try:
-            client.images.get(image)
+            client.images.get(base_image)
+            image = base_image
+            image_source = 'prebuilt'
+            logger.info(f'Using prebuilt image: {base_image}')
         except docker.errors.ImageNotFound:
-            logger.warning(f'Image {image} not found in dind')
-            # Try to build from workspace-template
-            # Note: In dind, we need to copy the template or use a different approach
-            # For MVP, we'll pull a base image and set up the workspace manually
-            try:
-                logger.info(f'Pulling fallback image node:20-slim into dind')
-                image = 'node:20-slim'
-                client.images.pull(image)
-            except docker.errors.DockerException as pull_error:
-                logger.error(f'Failed to pull image in dind: {pull_error}')
-                raise
+            logger.error(f'Prebuilt image {base_image} not found in dind')
+            error_msg = (
+                f'Workspace image not found: {base_image}. '
+                'Please run: python manage.py prebuild_workspace_images --build'
+            )
+            workspace.transition_status('error', error_msg)
+            workspace.save()
+            create_audit_log(
+                event_type='WORKSPACE_ERROR',
+                user_id=workspace.owner_id,
+                workspace_id=workspace.id,
+                details={'data_dir_path': data_dir_path},
+                error_message=error_msg,
+            )
+            return
 
-        # Create container with security hardening
+        # Create container with security hardening and bind mounts for workspace and history
+        # Mount workspace and history directories separately (not entire /home/user)
+        # Use HOST_WORKSPACE_DATA_ROOT for bind mount source paths
+        host_workspace_path = os.path.join(bind_mount_path, 'workspace')
+        host_history_path = os.path.join(bind_mount_path, 'history')
+
         container = client.containers.create(
             image=image,
             name=container_name,
@@ -125,9 +208,15 @@ def create_workspace_container(self, workspace_id: str):
             environment={
                 'WORKSPACE_ID': str(workspace_id),
                 'NODE_ENV': 'development',
+                # Workspace Client authentication
+                'ATOMSX_AUTH_TOKEN': workspace_token.token,
+                'ATOMSX_BACKEND_WS_URL': settings.WORKSPACE_CLIENT_WS_URL,
+                'ATOMSX_BACKEND_HTTP_URL': settings.WORKSPACE_CLIENT_HTTP_URL,
             },
+            # Mount workspace and history directories separately
             volumes={
-                volume_name: {'bind': '/workspace', 'mode': 'rw'},
+                host_workspace_path: {'bind': '/home/user/workspace', 'mode': 'rw'},
+                host_history_path: {'bind': '/home/user/history', 'mode': 'rw'},
             },
             # Use port range 30000-30100 for dind port mapping
             ports={'3000/tcp': None},  # Random port assignment within dind
@@ -136,6 +225,7 @@ def create_workspace_container(self, workspace_id: str):
                 'atomsx.workspace': 'true',
                 'atomsx.workspace_id': str(workspace_id),
                 'atomsx.owner_id': str(workspace.owner_id),
+                'atomsx.data_dir_path': data_dir_path,
             },
             # Resource limits (4.4)
             mem_limit='512m',
@@ -146,7 +236,7 @@ def create_workspace_container(self, workspace_id: str):
             security_opt=['no-new-privileges'],  # Prevent privilege escalation
             cap_drop=['ALL'],  # Drop all Linux capabilities
             cap_add=['CHOWN', 'SETUID', 'SETGID'],  # Only add necessary ones
-            read_only=False,  # Can't be read-only due to /workspace writes
+            read_only=False,  # Can't be read-only due to writes
             privileged=False,  # Never run as privileged
             # No Docker socket mounted - container is fully isolated
         )
@@ -163,18 +253,36 @@ def create_workspace_container(self, workspace_id: str):
         # Update workspace record
         workspace.container_id = container.id
         workspace.container_host = f'dind:{host_port}' if host_port else None
+        workspace.data_dir_path = data_dir_path
         workspace.transition_status('running')
         workspace.save()
 
-        # Audit log
+        # Audit log with image source and data directory path
         create_audit_log(
             event_type='WORKSPACE_CREATED',
             user_id=workspace.owner_id,
             workspace_id=workspace.id,
             container_id=container.id,
+            details={'data_dir_path': data_dir_path, 'image_source': image_source},
         )
 
-        logger.info(f'Created container {container.id} for workspace {workspace_id} in dind')
+        logger.info(f'Created container {container.id} for workspace {workspace_id} in dind (image_source: {image_source}, data_dir: {data_dir_path})')
+
+    except SoftTimeLimitExceeded:
+        logger.error(f'Workspace creation exceeded soft time limit ({settings.WORKSPACE_CREATION_SOFT_TIMEOUT}s)')
+        workspace.transition_status(
+            'error',
+            f'Workspace creation timeout exceeded (soft limit: {settings.WORKSPACE_CREATION_SOFT_TIMEOUT}s)'
+        )
+        workspace.save()
+        create_audit_log(
+            event_type='WORKSPACE_ERROR',
+            user_id=workspace.owner_id,
+            workspace_id=workspace.id,
+            details={'data_dir_path': workspace.data_dir_path},
+            error_message=f'timeout (soft limit: {settings.WORKSPACE_CREATION_SOFT_TIMEOUT}s)',
+        )
+        return  # Don't retry timeout errors
 
     except DinDHealthCheckError as e:
         logger.error(f'Dind connection error during container creation: {e}')
@@ -184,6 +292,7 @@ def create_workspace_container(self, workspace_id: str):
             event_type='WORKSPACE_ERROR',
             user_id=workspace.owner_id,
             workspace_id=workspace.id,
+            details={'data_dir_path': workspace.data_dir_path},
             error_message=f'Dind connection error: {e}',
         )
         raise self.retry(exc=e)
@@ -197,6 +306,7 @@ def create_workspace_container(self, workspace_id: str):
             event_type='WORKSPACE_ERROR',
             user_id=workspace.owner_id,
             workspace_id=workspace.id,
+            details={'data_dir_path': workspace.data_dir_path},
             error_message=f'Docker operation error: {e}',
         )
 
@@ -212,8 +322,10 @@ def delete_workspace_container(self, workspace_id: str):
     This task:
     1. Stops the container
     2. Removes the container
-    3. Removes the volume
-    4. Soft-deletes the workspace record
+    3. Preserves user data directory on host
+    4. Deletes the workspace record
+
+    Note: User data directory is NOT deleted to allow for data recovery and reuse.
     """
     try:
         workspace = Workspace.objects.get(id=workspace_id)
@@ -221,9 +333,17 @@ def delete_workspace_container(self, workspace_id: str):
         logger.error(f'Workspace {workspace_id} not found')
         return
 
+    data_dir_path = workspace.data_dir_path
+
     if not workspace.container_id:
         logger.warning(f'Workspace {workspace_id} has no container')
         workspace.delete()
+        create_audit_log(
+            event_type='WORKSPACE_DELETED',
+            user_id=workspace.owner_id,
+            workspace_id=workspace.id,
+            details={'data_dir_path': data_dir_path, 'note': 'Container not found, data directory preserved'},
+        )
         return
 
     # Verify dind is healthy before proceeding
@@ -237,7 +357,7 @@ def delete_workspace_container(self, workspace_id: str):
             event_type='WORKSPACE_DELETED',
             user_id=workspace.owner_id,
             workspace_id=workspace.id,
-            error_message=f'Cleanup skipped: Dind not enabled',
+            details={'data_dir_path': data_dir_path, 'note': 'Cleanup skipped: Dind not enabled, data directory preserved'},
         )
         return
     except DinDHealthCheckError as e:
@@ -261,26 +381,31 @@ def delete_workspace_container(self, workspace_id: str):
             container.remove()
             logger.info(f'Removed container {workspace.container_id} from dind')
 
-        # Remove volume from dind
-        volume_name = f'workspace-{workspace_id}'
+        # Delete the workspace auth token (cleanup)
         try:
-            volume = client.volumes.get(volume_name)
-            volume.remove()
-            logger.info(f'Removed volume {volume_name} from dind')
-        except docker.errors.NotFound:
-            logger.warning(f'Volume {volume_name} not found in dind')
+            if hasattr(workspace, 'auth_token') and workspace.auth_token:
+                workspace.auth_token.delete()
+                logger.info(f'Deleted auth token for workspace {workspace_id}')
+        except Exception as e:
+            logger.warning(f'Failed to delete auth token for workspace {workspace_id}: {e}')
 
-        # Audit log
+        # Note: We do NOT remove the user data directory
+        # Data persists on host filesystem for recovery/reuse
+        if data_dir_path:
+            logger.info(f'Data directory preserved at: {data_dir_path}')
+
+        # Audit log - container deleted, data preserved
         create_audit_log(
             event_type='WORKSPACE_DELETED',
             user_id=workspace.owner_id,
             workspace_id=workspace.id,
+            details={'data_dir_path': data_dir_path, 'note': 'Container deleted, data directory preserved on host'},
         )
 
         # Delete workspace record
         workspace.delete()
 
-        logger.info(f'Deleted workspace {workspace_id} from dind')
+        logger.info(f'Deleted workspace {workspace_id} from dind (data preserved at: {data_dir_path})')
 
     except DinDHealthCheckError as e:
         logger.error(f'Dind connection error during container deletion: {e}')
@@ -293,8 +418,75 @@ def delete_workspace_container(self, workspace_id: str):
             event_type='WORKSPACE_ERROR',
             user_id=workspace.owner_id,
             workspace_id=workspace.id,
+            details={'data_dir_path': data_dir_path},
             error_message=f'Docker operation error during deletion: {e}',
         )
 
         # Retry the task
         raise self.retry(exc=e)
+
+
+@shared_task
+def cleanup_workspace_token(workspace_id: str):
+    """
+    Delete the WorkspaceToken for a workspace.
+
+    Used when a container stops unexpectedly or for manual cleanup.
+    """
+    try:
+        workspace = Workspace.objects.get(id=workspace_id)
+        if hasattr(workspace, 'auth_token') and workspace.auth_token:
+            workspace.auth_token.delete()
+            logger.info(f'Cleaned up auth token for workspace {workspace_id}')
+            return True
+    except Workspace.DoesNotExist:
+        logger.warning(f'Workspace {workspace_id} not found for token cleanup')
+    except Exception as e:
+        logger.error(f'Failed to cleanup token for workspace {workspace_id}: {e}')
+    return False
+
+
+@shared_task
+def cleanup_orphaned_tokens():
+    """
+    Periodic task to clean up orphaned WorkspaceTokens.
+
+    Orphaned tokens occur when:
+    - Container crashes unexpectedly
+    - Workspace status is not 'running' but token still exists
+    - Container was manually removed outside the system
+
+    This task checks for tokens where:
+    - Workspace status is not 'running'
+    - OR workspace has no container_id
+
+    And deletes them to maintain security.
+    """
+    # Find tokens for workspaces that are not running
+    orphaned_tokens = WorkspaceToken.objects.filter(
+        workspace__status__in=['stopped', 'error', 'deleting']
+    ) | WorkspaceToken.objects.filter(
+        workspace__container_id__isnull=True
+    )
+
+    # Exclude creating status (token might be just created)
+    orphaned_tokens = orphaned_tokens.exclude(
+        workspace__status='creating'
+    )
+
+    count = orphaned_tokens.count()
+    if count > 0:
+        for token in orphaned_tokens:
+            logger.info(
+                f'Deleting orphaned token for workspace {token.workspace.id} '
+                f'(status: {token.workspace.status}, container: {token.workspace.container_id})'
+            )
+            token.delete()
+
+        logger.info(f'Cleaned up {count} orphaned workspace tokens')
+        create_audit_log(
+            event_type='TOKEN_CLEANUP',
+            details={'count': count, 'reason': 'orphaned_tokens'},
+        )
+
+    return count

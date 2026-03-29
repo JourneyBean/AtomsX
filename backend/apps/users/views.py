@@ -84,6 +84,7 @@ class OIDCCallbackView(View):
             oidc_sub = user_info.get('sub')
             email = user_info.get('email')
             display_name = user_info.get('name') or user_info.get('preferred_username') or email
+            avatar_url = user_info.get('picture')
 
             if not oidc_sub or not email:
                 logger.error('OIDC user info missing sub or email')
@@ -94,6 +95,7 @@ class OIDCCallbackView(View):
                 oidc_sub=oidc_sub,
                 email=email,
                 display_name=display_name,
+                avatar_url=avatar_url,
             )
 
             # Log user in
@@ -168,6 +170,7 @@ class CurrentUserView(View):
             'id': str(user.id),
             'email': user.email,
             'display_name': user.display_name,
+            'avatar_url': user.avatar_url,
             'oidc_sub': user.oidc_sub,
             'created_at': user.created_at.isoformat(),
         })

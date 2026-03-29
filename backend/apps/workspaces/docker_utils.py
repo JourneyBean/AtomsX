@@ -28,6 +28,13 @@ class DinDHealthCheckError(Exception):
     pass
 
 
+class UserDataDirectoryError(Exception):
+    """Raised when user data directory operations fail."""
+    def __init__(self, message: str, reason: str = None):
+        super().__init__(message)
+        self.reason = reason
+
+
 def check_dind_health(client: docker.DockerClient) -> Dict[str, Any]:
     """
     Check if dind Docker daemon is healthy and accessible.

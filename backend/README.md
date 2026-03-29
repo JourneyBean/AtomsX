@@ -129,6 +129,102 @@ backend/
 
 ## 故障排除
 
+### User Data Storage
+
+Workspace 用户数据存储在宿主机的持久化目录中，使用 UUID 二级分片结构组织。
+
+#### 目录结构
+
+```
+{WORKSPACE_DATA_ROOT}/
+├── a/                           # UUID 首字符分片 (16个: 0-9, a-f)
+│   ├── b/                       # UUID 第二字符分片 (16个)
+│   │   └── abc12345-.../        # 完整 UUID 作为目录名
+│   │       ├── workspace/       # 用户代码仓库
+│   │       └── history/         # 对话历史
+│   └── c/
+│       └── ac789012-.../
+├── 0/
+│   └── 1/
+│       └── 01234567-.../
+└── ...
+```
+
+#### 配置
+
+| 环境变量 | 开发默认值 | 生产默认值 | 说明 |
+|---------|-----------|-----------|------|
+| `ATOMSX_WORKSPACE_DATA_ROOT` | `/var/opt/atomsx/workspaces` | Workspace 数据存储根目录 |
+
+#### 分片原理
+
+- **首字符分片**: 16 个目录 (UUID 字符: 0-9, a-f)
+- **第二字符分片**: 每个首字符目录下 16 个子目录
+- **支持规模**: 单机可支持百万级 Workspace 而不出现目录性能问题
+- **与业界一致**: GitLab、Gitea 等项目采用类似策略
+
+#### 数据生命周期
+
+- **创建**: Workspace 创建时自动创建数据目录
+- **挂载**: 数据目录挂载为容器内 `/home/user`
+- **删除**: Workspace 删除时**保留**数据目录，支持数据恢复和复用
+
+#### 示例
+
+```bash
+# 开发环境数据目录
+./dev-cache/data/a/b/abc12345-def6-7890-abcd-ef1234567890/
+
+# 生产环境数据目录
+/var/opt/atomsx/a/b/abc12345-def6-7890-abcd-ef1234567890/
+```
+
+### Workspace Image Management
+
+#### Prebuilding Workspace Images
+
+Before creating workspaces, prebuild the workspace image for faster startup:
+
+```bash
+# Prebuild default workspace image
+uv run python manage.py prebuild_workspace_images
+
+# Prebuild custom image
+uv run python manage.py prebuild_workspace_images --image custom-workspace:v1
+
+# Force rebuild (remove existing image first)
+uv run python manage.py prebuild_workspace_images --force
+
+# Verbose output
+uv run python manage.py prebuild_workspace_images --verbose
+```
+
+**Benefits:**
+- Significantly reduces workspace creation time
+- Avoids image pull delays during workspace startup
+- Ensures consistent image availability across environments
+
+#### Timeout Configuration
+
+Workspace creation timeout can be configured via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WORKSPACE_CREATION_SOFT_TIMEOUT` | 300 (5 min) | Soft timeout - task receives exception for cleanup |
+| `WORKSPACE_CREATION_HARD_TIMEOUT` | 360 (6 min) | Hard timeout - task is forcibly terminated |
+
+**Example:**
+```bash
+# Set custom timeouts (in seconds)
+export WORKSPACE_CREATION_SOFT_TIMEOUT=600  # 10 minutes
+export WORKSPACE_CREATION_HARD_TIMEOUT=720  # 12 minutes
+```
+
+**Recommendations:**
+- Soft timeout should allow enough time for image pull + container creation
+- Hard timeout should be at least 60 seconds longer than soft timeout
+- Adjust based on network speed and image size
+
 ### uv sync 失败
 
 如果遇到依赖安装问题：

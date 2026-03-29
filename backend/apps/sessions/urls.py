@@ -8,6 +8,7 @@ from .views import (
     SessionStreamView,
     SessionMessageView,
     SessionInterruptView,
+    SessionResumeView,
 )
 
 urlpatterns = [
@@ -17,4 +18,5 @@ urlpatterns = [
     path('<uuid:session_id>/stream/', SessionStreamView.as_view(), name='session-stream'),
     path('<uuid:session_id>/messages/', SessionMessageView.as_view(), name='session-messages'),
     path('<uuid:session_id>/interrupt/', SessionInterruptView.as_view(), name='session-interrupt'),
+    path('<uuid:session_id>/resume/', SessionResumeView.as_view(), name='session-resume'),
 ]

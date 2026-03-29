@@ -34,7 +34,9 @@ services:
       OIDC_PROVIDER_URL: ${OIDC_PROVIDER_URL:-http://authentik-server:9000/application/o/atomsx/}
     volumes:
       - ./backend:/app
+      - ./workspace-templates:/workspace-templates:ro  # Workspace image templates (read-only)
       - /var/run/docker.sock:/var/run/docker.sock  # Mount host Docker socket
+      - .dev-cache/docker/atomsx:/var/opt/atomsx  # Workspace data storage
     # Override: don't depend on dind in dev
     depends_on:
       postgres:
@@ -48,9 +50,14 @@ services:
       # Use host Docker socket in development
       DOCKER_HOST: unix:///var/run/docker.sock
       DIND_ENABLED: "false"
+      # Host path for Docker bind mounts (different from internal container path)
+      ATOMSX_HOST_WORKSPACE_DATA_ROOT: /home/johnson/projects/AtomsX/.dev-cache/docker/atomsx/workspaces
+      # Use atomsx-network for workspace containers (so they can reach backend)
+      WORKSPACE_NETWORK_NAME: atomsx-network
     volumes:
       - ./backend:/app
       - /var/run/docker.sock:/var/run/docker.sock  # Mount host Docker socket
+      - .dev-cache/docker/atomsx:/var/opt/atomsx  # Workspace data storage
     # Override: don't depend on dind in dev
     depends_on:
       postgres:
@@ -70,6 +77,7 @@ services:
 
   # ===========================================================================
   # Gateway - dev port override
+  # ATOMSX_PREVIEW_DOMAIN env inherited from base docker-compose.yml
   # ===========================================================================
   gateway:
     ports:

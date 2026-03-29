@@ -2,6 +2,7 @@ export interface User {
   id: string
   email: string
   display_name: string
+  avatar_url: string | null
   oidc_sub: string
   created_at: string
 }
@@ -11,6 +12,7 @@ export interface Workspace {
   name: string
   status: 'creating' | 'running' | 'stopped' | 'error' | 'deleting'
   container_id: string | null
+  preview_url: string | null
   created_at: string
   updated_at: string
 }
@@ -26,6 +28,7 @@ export interface Session {
 }
 
 export interface Message {
+  id?: string
   role: 'user' | 'agent'
   content: string
   timestamp: string
@@ -39,3 +42,14 @@ export interface CreateWorkspaceRequest {
 export interface SendMessageRequest {
   content: string
 }
+
+export interface Notification {
+  id: string
+  type: 'success' | 'warning' | 'error'
+  message: string
+  duration: number
+  timestamp: number
+}
+
+// File Browser Types
+export * from './file'

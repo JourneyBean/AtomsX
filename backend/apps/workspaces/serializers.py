@@ -10,6 +10,9 @@ class WorkspaceSerializer(serializers.ModelSerializer):
     Serializer for Workspace model.
     """
 
+    preview_url = serializers.CharField(read_only=True)
+    deploy_url = serializers.CharField(read_only=True)
+
     class Meta:
         model = Workspace
         fields = [
@@ -17,10 +20,13 @@ class WorkspaceSerializer(serializers.ModelSerializer):
             'name',
             'status',
             'container_id',
+            'preview_url',
+            'deploy_url',
+            'data_dir_path',
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'status', 'container_id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'status', 'container_id', 'preview_url', 'deploy_url', 'data_dir_path', 'created_at', 'updated_at']
 
 
 class CreateWorkspaceSerializer(serializers.Serializer):

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 FROM node:20-alpine
 
 # Proxy support build arguments
@@ -8,19 +9,37 @@ ARG http_proxy
 ARG https_proxy
 ARG no_proxy
 
+# npm registry mirror (defaults to npmmirror for better China connectivity)
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json* ./
-
-# Install dependencies with proxy support
-RUN if [ -n "$HTTP_PROXY" ]; then \
+# Configure npm with registry and proxy, then install with retry
+# Using BuildKit cache mount for npm cache directory
+RUN --mount=type=cache,target=/root/.npm \
+    npm config set registry $NPM_REGISTRY && \
+    if [ -n "$HTTP_PROXY" ]; then \
         npm config set proxy $HTTP_PROXY; \
     fi && \
     if [ -n "$HTTPS_PROXY" ]; then \
         npm config set https-proxy $HTTPS_PROXY; \
     fi && \
-    npm install && \
+    # Retry logic: try up to 3 times with exponential backoff
+    for i in 1 2 3; do \
+        echo "Attempt $i: Installing npm dependencies..."; \
+        if npm install --prefer-offline --no-audit; then \
+            echo "npm install succeeded on attempt $i"; \
+            break; \
+        fi; \
+        if [ $i -lt 3 ]; then \
+            sleep=$((i * 5)); \
+            echo "npm install failed, retrying in $sleep seconds..."; \
+            sleep $sleep; \
+        else \
+            echo "npm install failed after 3 attempts"; \
+            exit 1; \
+        fi; \
+    done && \
     npm config delete proxy 2>/dev/null || true && \
     npm config delete https-proxy 2>/dev/null || true
 

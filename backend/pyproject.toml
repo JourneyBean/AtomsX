@@ -39,6 +39,12 @@ dependencies = [
     "docker==7.1",
     # Utilities
     "python-dotenv==1.0",
+    # WebSocket support
+    "channels>=4.0",
+    "channels-redis>=4.0",
+    "daphne>=4.0",
+    # Agent SDK
+    "claude-agent-sdk>=0.1.51",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +56,9 @@ dev = [
 
 [project.scripts]
 atomsx-manage = "manage:main"
+
+[[tool.uv.index]]
+url = "https://mirrors.ustc.edu.cn/pypi/simple"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -1,43 +1,103 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useAuthStore } from '@/stores/auth'
 import { useSessionStore } from '@/stores/session'
+import { useNotificationStore } from '@/stores/notification'
+import CodeView from '@/components/CodeView.vue'
 import type { Workspace } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
-const authStore = useAuthStore()
 const sessionStore = useSessionStore()
+const notificationStore = useNotificationStore()
 
 const workspace = ref<Workspace | null>(null)
 const newMessage = ref('')
 const currentTaskId = ref<string | undefined>()
 const workspaceId = route.params.id as string
 
+// Tab state: 'preview' or 'code'
+const activeTab = ref<'preview' | 'code'>('preview')
+
+// Preview availability state
+const previewReady = ref<boolean | null>(null) // null = not checked yet
+const previewError = ref<string>('')
+const checkingPreview = ref(false)
+
 const previewUrl = computed(() => {
-  if (workspace.value?.status === 'running') {
-    return `http://${workspaceId}.preview.local`
+  const baseUrl = workspace.value?.preview_url || ''
+  if (!baseUrl) return ''
+  // Append current page's port if not standard (80/443)
+  const port = window.location.port
+  if (port && port !== '80' && port !== '443') {
+    // Insert port before the path (baseUrl is like http://xxx.preview.localhost)
+    return baseUrl.replace(/^http(s?):\/\/([^\/]+)(\/.*)?$/, `http$1://$2:${port}$3`)
   }
-  return ''
+  return baseUrl
 })
 
 onMounted(async () => {
   await fetchWorkspace()
   await sessionStore.startSession(workspaceId)
+  // Check preview availability if workspace is running and preview tab is active
+  if (workspace.value?.status === 'running' && activeTab.value === 'preview') {
+    checkPreviewAvailability()
+  }
 })
 
 onUnmounted(() => {
   sessionStore.clearSession()
 })
 
+async function checkPreviewAvailability() {
+  if (!previewUrl.value) {
+    previewReady.value = false
+    previewError.value = 'Preview URL not available'
+    return
+  }
+
+  checkingPreview.value = true
+
+  // Try normal fetch - if CORS allows, we can read the status code
+  try {
+    const response = await fetch(previewUrl.value, {
+      method: 'GET',
+    })
+    // Successfully read response - check status
+    if (response.status === 503) {
+      previewReady.value = false
+      previewError.value = 'Preview service is starting up. Please wait a moment and try again.'
+    } else if (!response.ok) {
+      previewReady.value = false
+      previewError.value = `Preview unavailable (status: ${response.status})`
+    } else {
+      previewReady.value = true
+      previewError.value = ''
+    }
+  } catch {
+    // Fetch threw an error - could be CORS blocked or network unreachable
+    // We can't determine the actual status, so let iframe try loading
+    // The iframe will show browser's error page if it fails
+    previewReady.value = true
+    previewError.value = ''
+  } finally {
+    checkingPreview.value = false
+  }
+}
+
 async function fetchWorkspace() {
-  const response = await fetch(`/api/workspaces/${workspaceId}/`, {
-    credentials: 'include',
-  })
-  if (response.ok) {
-    workspace.value = await response.json()
-  } else {
+  try {
+    const response = await fetch(`/api/workspaces/${workspaceId}/`, {
+      credentials: 'include',
+    })
+    if (response.ok) {
+      workspace.value = await response.json()
+    } else {
+      notificationStore.showError('Failed to load workspace')
+      router.push({ name: 'workspaces' })
+    }
+  } catch {
+    notificationStore.showError('Failed to load workspace')
     router.push({ name: 'workspaces' })
   }
 }
@@ -57,6 +117,29 @@ async function handleInterrupt() {
 
 function goBack() {
   router.push({ name: 'workspaces' })
+}
+
+function switchTab(tab: 'preview' | 'code') {
+  activeTab.value = tab
+  if (tab === 'preview' && workspace.value?.status === 'running') {
+    // Reset and check preview availability when switching to preview tab
+    previewReady.value = null
+    previewError.value = ''
+    checkPreviewAvailability()
+  }
+}
+
+// Retry checking preview availability
+function retryPreview() {
+  previewReady.value = null
+  previewError.value = ''
+  checkPreviewAvailability()
+}
+
+// Handle iframe load errors
+function onIframeError() {
+  previewReady.value = false
+  previewError.value = 'Preview failed to load. The workspace preview server may not be ready.'
 }
 </script>
 
@@ -115,17 +198,63 @@ function goBack() {
         </div>
       </div>
 
-      <!-- Right panel: Preview -->
-      <div class="preview-panel">
-        <div v-if="workspace?.status !== 'running'" class="preview-placeholder">
-          <p>Workspace is {{ workspace?.status }}...</p>
+      <!-- Right panel: Preview/Code with Tabs -->
+      <div class="right-panel">
+        <!-- Tab header -->
+        <div class="tab-header">
+          <button
+            :class="['tab-btn', { active: activeTab === 'preview' }]"
+            @click="switchTab('preview')"
+          >
+            Preview
+          </button>
+          <button
+            :class="['tab-btn', { active: activeTab === 'code' }]"
+            @click="switchTab('code')"
+          >
+            Code
+          </button>
         </div>
-        <iframe
-          v-else
-          :src="previewUrl"
-          class="preview-frame"
-          sandbox="allow-scripts allow-same-origin allow-forms"
-        />
+
+        <!-- Tab content -->
+        <div class="tab-content">
+          <!-- Preview Tab -->
+          <div v-if="activeTab === 'preview'" class="preview-container">
+            <div v-if="workspace?.status !== 'running'" class="preview-placeholder">
+              <p>Workspace is {{ workspace?.status }}...</p>
+            </div>
+            <div v-else-if="checkingPreview" class="preview-placeholder">
+              <p>Checking preview availability...</p>
+            </div>
+            <div v-else-if="previewReady === false" class="preview-placeholder preview-error">
+              <div class="error-content">
+                <p class="error-title">Preview Not Ready</p>
+                <p class="error-message">{{ previewError || 'The workspace preview is starting up. This usually takes a few seconds.' }}</p>
+                <p class="error-hint">Tip: If you just created this workspace, wait a moment and try again.</p>
+                <button @click="retryPreview" class="retry-btn">Retry</button>
+              </div>
+            </div>
+            <iframe
+              v-else-if="previewReady === true"
+              :src="previewUrl"
+              class="preview-frame"
+              sandbox="allow-scripts allow-same-origin allow-forms"
+              @error="onIframeError"
+            />
+            <!-- Default state when workspace is running but not yet checked -->
+            <div v-else class="preview-placeholder">
+              <p>Loading preview...</p>
+            </div>
+          </div>
+
+          <!-- Code Tab -->
+          <div v-if="activeTab === 'code'" class="code-container">
+            <div v-if="workspace?.status !== 'running'" class="code-placeholder">
+              <p>Workspace is {{ workspace?.status }}...</p>
+            </div>
+            <CodeView v-else :workspace-id="workspaceId" />
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -196,12 +325,14 @@ function goBack() {
   display: flex;
   flex-direction: column;
   border-right: 1px solid rgba(255, 255, 255, 0.1);
+  overflow: hidden;
 }
 
 .messages {
   flex: 1;
   padding: 24px;
   overflow-y: auto;
+  min-height: 0;
 }
 
 .message {
@@ -295,14 +426,53 @@ function goBack() {
   color: white;
 }
 
-.preview-panel {
+/* Right panel with tabs */
+.right-panel {
   display: flex;
   flex-direction: column;
   background: #0f0f1a;
 }
 
-.preview-placeholder {
+.tab-header {
+  display: flex;
+  padding: 8px 16px;
+  background: rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.tab-btn {
+  padding: 8px 16px;
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.9rem;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: all 0.15s;
+}
+
+.tab-btn:hover {
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.tab-btn.active {
+  color: #fff;
+  background: rgba(79, 70, 229, 0.3);
+}
+
+.tab-content {
   flex: 1;
+  overflow: hidden;
+}
+
+.preview-container,
+.code-container {
+  height: 100%;
+}
+
+.preview-placeholder,
+.code-placeholder {
+  height: 100%;
   display: flex;
   justify-content: center;
   align-items: center;
@@ -314,5 +484,49 @@ function goBack() {
   height: 100%;
   border: none;
   background: #fff;
+}
+
+.preview-error {
+  flex-direction: column;
+  gap: 16px;
+}
+
+.error-content {
+  text-align: center;
+  padding: 24px;
+  max-width: 400px;
+}
+
+.error-title {
+  color: #f59e0b;
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.error-message {
+  color: rgba(255, 255, 255, 0.7);
+  margin-bottom: 12px;
+}
+
+.error-hint {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 0.85rem;
+  margin-bottom: 16px;
+}
+
+.retry-btn {
+  padding: 10px 20px;
+  background: #4f46e5;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: background 0.15s;
+}
+
+.retry-btn:hover {
+  background: #4338ca;
 }
 </style>

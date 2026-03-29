@@ -2,10 +2,12 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { useNotificationStore } from '@/stores/notification'
 import type { Workspace } from '@/types'
 
 const router = useRouter()
 const authStore = useAuthStore()
+const notificationStore = useNotificationStore()
 const workspaces = ref<Workspace[]>([])
 const isLoading = ref(false)
 const newWorkspaceName = ref('')
@@ -23,7 +25,11 @@ async function fetchWorkspaces() {
     })
     if (response.ok) {
       workspaces.value = await response.json()
+    } else {
+      notificationStore.showError('Failed to load workspaces')
     }
+  } catch {
+    notificationStore.showError('Failed to load workspaces')
   } finally {
     isLoading.value = false
   }
@@ -43,18 +49,31 @@ async function createWorkspace() {
       const workspace = await response.json()
       workspaces.value.unshift(workspace)
       newWorkspaceName.value = ''
+    } else {
+      const data = await response.json().catch(() => ({ error: 'Failed to create workspace' }))
+      notificationStore.showError(data.error || 'Failed to create workspace')
     }
+  } catch {
+    notificationStore.showError('Failed to create workspace')
   } finally {
     isCreating.value = false
   }
 }
 
 async function deleteWorkspace(id: string) {
-  await fetch(`/api/workspaces/${id}/`, {
-    method: 'DELETE',
-    credentials: 'include',
-  })
-  workspaces.value = workspaces.value.filter(w => w.id !== id)
+  try {
+    const response = await fetch(`/api/workspaces/${id}/`, {
+      method: 'DELETE',
+      credentials: 'include',
+    })
+    if (response.ok) {
+      workspaces.value = workspaces.value.filter(w => w.id !== id)
+    } else {
+      notificationStore.showError('Failed to delete workspace')
+    }
+  } catch {
+    notificationStore.showError('Failed to delete workspace')
+  }
 }
 
 function openWorkspace(id: string) {
@@ -71,6 +90,13 @@ function handleLogout() {
     <header class="header">
       <h1>AtomsX</h1>
       <div class="user-info">
+        <img
+          v-if="authStore.user?.avatar_url"
+          :src="authStore.user.avatar_url"
+          :alt="authStore.user.display_name"
+          class="avatar"
+        />
+        <div v-else class="avatar-placeholder">{{ authStore.user?.display_name?.charAt(0)?.toUpperCase() }}</div>
         <span>{{ authStore.user?.display_name }}</span>
         <button @click="handleLogout" class="logout-btn">Logout</button>
       </div>
@@ -140,6 +166,26 @@ function handleLogout() {
   display: flex;
   gap: 16px;
   align-items: center;
+}
+
+.avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.avatar-placeholder {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #4f46e5;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .logout-btn {

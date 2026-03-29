@@ -14,7 +14,7 @@ class UserManager(BaseUserManager):
     Custom user manager for OIDC-based authentication.
     """
 
-    def create_user(self, oidc_sub, email, display_name=None, **extra_fields):
+    def create_user(self, oidc_sub, email, display_name=None, avatar_url=None, **extra_fields):
         """
         Create a user from OIDC information.
         """
@@ -27,12 +27,13 @@ class UserManager(BaseUserManager):
             oidc_sub=oidc_sub,
             email=self.normalize_email(email),
             display_name=display_name or email.split('@')[0],
+            avatar_url=avatar_url,
             **extra_fields,
         )
         user.save(using=self._db)
         return user
 
-    def create_superuser(self, oidc_sub, email, display_name=None, **extra_fields):
+    def create_superuser(self, oidc_sub, email, display_name=None, avatar_url=None, **extra_fields):
         """
         Create a superuser (for admin access).
         """
@@ -44,23 +45,25 @@ class UserManager(BaseUserManager):
         if extra_fields.get('is_superuser') is not True:
             raise ValueError('Superuser must have is_superuser=True.')
 
-        return self.create_user(oidc_sub, email, display_name, **extra_fields)
+        return self.create_user(oidc_sub, email, display_name, avatar_url, **extra_fields)
 
-    def get_or_create_from_oidc(self, oidc_sub: str, email: str, display_name: str = None):
+    def get_or_create_from_oidc(self, oidc_sub: str, email: str, display_name: str = None, avatar_url: str = None):
         """
         Get an existing user or create a new one from OIDC info.
         """
         try:
             user = self.get(oidc_sub=oidc_sub)
-            # Update email/display_name if changed
+            # Update email/display_name/avatar if changed
             if user.email != email:
                 user.email = email
             if display_name and user.display_name != display_name:
                 user.display_name = display_name
-            user.save(update_fields=['email', 'display_name'])
+            if avatar_url and user.avatar_url != avatar_url:
+                user.avatar_url = avatar_url
+            user.save(update_fields=['email', 'display_name', 'avatar_url'])
             return user, False
         except self.model.DoesNotExist:
-            return self.create_user(oidc_sub, email, display_name), True
+            return self.create_user(oidc_sub, email, display_name, avatar_url), True
 
 
 class User(AbstractBaseUser, PermissionsMixin):
@@ -79,6 +82,12 @@ class User(AbstractBaseUser, PermissionsMixin):
     )
     email = models.EmailField(unique=True, help_text='Email from OIDC provider')
     display_name = models.CharField(max_length=255, help_text='Display name from OIDC provider')
+    avatar_url = models.URLField(
+        max_length=500,
+        blank=True,
+        null=True,
+        help_text='Avatar/picture URL from OIDC provider',
+    )
 
     # Required for Django admin
     is_staff = models.BooleanField(default=False, help_text='Can access Django admin')

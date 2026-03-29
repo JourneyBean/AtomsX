@@ -41,3 +41,20 @@ class SendMessageSerializer(serializers.Serializer):
     """
 
     content = serializers.CharField(help_text='Message content to send to the Agent')
+
+
+class ResumeSessionSerializer(serializers.Serializer):
+    """
+    Serializer for resuming a session from history.
+
+    The history directory contains session folders with claude_session_id.
+    Backend reads /home/user/history/ to find available sessions.
+    """
+
+    history_session_id = serializers.CharField(
+        help_text='Session ID from history directory to resume',
+    )
+    content = serializers.CharField(
+        required=False,
+        help_text='Optional message content to send after resume',
+    )

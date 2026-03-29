@@ -1,0 +1,221 @@
+worker_processes auto;
+error_log /usr/local/openresty/nginx/logs/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+
+    # WebSocket upgrade handling - only upgrade when client requests it
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" '
+                    'workspace=$workspace_id';
+
+    access_log /usr/local/openresty/nginx/logs/access.log main;
+
+    sendfile        on;
+    keepalive_timeout  65;
+
+    # Lua shared dict for caching workspace->container mappings
+    lua_shared_dict workspace_cache 10m;
+
+    # Lua package path
+    lua_package_path "/usr/local/openresty/lua/?.lua;;";
+
+    # Upstream definitions
+    upstream backend {
+        server backend:8000;
+    }
+
+    upstream frontend {
+        server frontend:5173;
+    }
+
+    # Main server block
+    server {
+        listen 80;
+        # Use catch-all instead of hardcoded localhost
+        # In production, this will be overridden by actual domain
+        server_name _;
+
+        # API requests go to Django backend (HTTP + WebSocket)
+        location /api/ {
+            proxy_pass http://backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # WebSocket support
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+
+            # SSE support for streaming
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 86400s;
+        }
+
+        # Frontend requests go to Vite dev server
+        location / {
+            proxy_pass http://frontend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+
+            # WebSocket support (Vite HMR)
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+        }
+
+        # Health check endpoint
+        location /health {
+            return 200 "OK\n";
+            add_header Content-Type text/plain;
+        }
+    }
+
+    # Preview server block - handles *.${ATOMSX_PREVIEW_DOMAIN}
+    # Note: server_name matches HTTP Host header which does NOT include port
+    # (Host header excludes port for standard ports 80/443)
+    server {
+        listen 80;
+        server_name ~^(?<workspace_id>[a-f0-9\-]+)\.${ATOMSX_PREVIEW_DOMAIN}$;
+
+        # Docker internal DNS resolver for Lua HTTP requests
+        # Docker embedded DNS server runs at 127.0.0.11:53
+        resolver 127.0.0.11 valid=30s ipv6=off;
+        resolver_timeout 5s;
+
+        # Set workspace_id variable for logging
+        set $workspace_id $workspace_id;
+
+        # Pre-declare container_host for Lua to set dynamically
+        set $container_host "";
+
+        # Handle OPTIONS preflight requests - return CORS headers without auth check
+        if ($request_method = 'OPTIONS') {
+            add_header 'Access-Control-Allow-Origin' '*' always;
+            add_header 'Access-Control-Allow-Methods' 'GET, HEAD, OPTIONS' always;
+            add_header 'Access-Control-Allow-Headers' '*' always;
+            add_header 'Access-Control-Max-Age' 86400 always;
+            add_header 'Content-Length' 0;
+            return 204;
+        }
+
+        # Add CORS headers to all responses using Lua header_filter
+        # This is more reliable than nginx add_header in location blocks
+        header_filter_by_lua_block {
+            ngx.header['Access-Control-Allow-Origin'] = '*'
+            ngx.header['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
+            ngx.header['Access-Control-Allow-Headers'] = '*'
+        }
+
+        # Authentication check via Lua
+        access_by_lua_block {
+            local auth = require "auth_check"
+            auth.check(ngx.var.workspace_id)
+        }
+
+        # Proxy to workspace container
+        location / {
+            # Dynamic upstream resolution based on workspace_id
+            proxy_pass http://$container_host;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # WebSocket support (HMR, etc.)
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+
+            # SSE support for HMR
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 86400s;
+
+            # Error handling
+            proxy_intercept_errors on;
+            error_page 502 503 504 = @workspace_error;
+        }
+
+        # Error handling for workspace not available
+        location @workspace_error {
+            content_by_lua_block {
+                ngx.header['Access-Control-Allow-Origin'] = '*'
+                ngx.header['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
+                ngx.header['Access-Control-Allow-Headers'] = '*'
+                ngx.header['Content-Type'] = 'text/html'
+                ngx.status = 503
+                ngx.say('<html><body><h1>Workspace Unavailable</h1><p>The workspace is not currently running. Please try again later.</p></body></html>')
+                ngx.exit(503)
+            }
+        }
+    }
+
+    # Deploy server block - handles *.${ATOMSX_DEPLOY_DOMAIN}
+    # Note: server_name matches HTTP Host header which does NOT include port
+    server {
+        listen 80;
+        server_name ~^(?<workspace_id>[a-f0-9\-]+)\.${ATOMSX_DEPLOY_DOMAIN}$;
+
+        # Docker internal DNS resolver for Lua HTTP requests
+        resolver 127.0.0.11 valid=30s ipv6=off;
+        resolver_timeout 5s;
+
+        # Set workspace_id variable for logging
+        set $workspace_id $workspace_id;
+
+        # Pre-declare container_host for Lua to set dynamically
+        set $container_host "";
+
+        # Authentication check via Lua
+        access_by_lua_block {
+            local auth = require "auth_check"
+            auth.check(ngx.var.workspace_id)
+        }
+
+        # Proxy to workspace container
+        location / {
+            # Dynamic upstream resolution based on workspace_id
+            proxy_pass http://$container_host;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # WebSocket support
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+
+            # SSE support
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 86400s;
+
+            # Error handling
+            proxy_intercept_errors on;
+            error_page 502 503 504 = @workspace_error;
+        }
+
+        # Error handling for workspace not available
+        location @workspace_error {
+            default_type text/html;
+            return 503 '<html><body><h1>Workspace Unavailable</h1><p>The workspace is not currently running. Please try again later.</p></body></html>';
+        }
+    }
+}

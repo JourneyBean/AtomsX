@@ -2,6 +2,9 @@
 # Authentik persistent data, etc.
 .dev-cache/
 
+# User data directory for workspaces (development environment)
+dev-cache/
+
 # Environment files (keep .env.example)
 .env
 .env.local
