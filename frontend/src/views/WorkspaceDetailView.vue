@@ -51,6 +51,11 @@ const isDraggingHistory = ref(false)
 function startDragLeftPanel(e: MouseEvent) {
   isDraggingLeftPanel.value = true
   e.preventDefault()
+  // Disable pointer events on right panel to prevent iframe capturing mouse events
+  const rightPanel = document.querySelector('.right-panel')
+  if (rightPanel) {
+    rightPanel.style.setProperty('pointer-events', 'none')
+  }
 }
 
 function startDragHistory(e: MouseEvent) {
@@ -80,6 +85,11 @@ function handleMouseMove(e: MouseEvent) {
 function handleMouseUp() {
   isDraggingLeftPanel.value = false
   isDraggingHistory.value = false
+  // Restore pointer events on right panel
+  const rightPanel = document.querySelector('.right-panel')
+  if (rightPanel) {
+    rightPanel.style.setProperty('pointer-events', 'auto')
+  }
 }
 
 const previewUrl = computed(() => {
@@ -278,10 +288,12 @@ function goBack() {
 function switchTab(tab: 'preview' | 'code') {
   activeTab.value = tab
   if (tab === 'preview' && workspace.value?.status === 'running') {
-    // Reset and check preview availability when switching to preview tab
-    previewReady.value = null
-    previewError.value = ''
-    checkPreviewAvailability()
+    // Only check preview if not already ready or not yet checked
+    if (previewReady.value !== true) {
+      previewReady.value = null
+      previewError.value = ''
+      checkPreviewAvailability()
+    }
   }
 }
 
@@ -555,8 +567,8 @@ function renderMarkdown(content: string): string {
 
         <!-- Tab content -->
         <div class="tab-content">
-          <!-- Preview Tab -->
-          <div v-if="activeTab === 'preview'" class="preview-container">
+          <!-- Preview Tab - use v-show to preserve iframe state -->
+          <div v-show="activeTab === 'preview'" class="preview-container">
             <div v-if="workspace?.status !== 'running'" class="preview-placeholder">
               <p>Workspace is {{ workspace?.status }}...</p>
             </div>
@@ -585,7 +597,7 @@ function renderMarkdown(content: string): string {
           </div>
 
           <!-- Code Tab -->
-          <div v-if="activeTab === 'code'" class="code-container">
+          <div v-show="activeTab === 'code'" class="code-container">
             <div v-if="workspace?.status !== 'running'" class="code-placeholder">
               <p>Workspace is {{ workspace?.status }}...</p>
             </div>
@@ -1052,11 +1064,13 @@ function renderMarkdown(content: string): string {
 .tab-content {
   flex: 1;
   overflow: hidden;
+  position: relative;
 }
 
 .preview-container,
 .code-container {
-  height: 100%;
+  position: absolute;
+  inset: 0;
 }
 
 .preview-placeholder,
