@@ -443,20 +443,35 @@ class SessionResumeView(View):
     Resume a session from history directory and return SSE stream.
     """
 
-    def post(self, request, session_id):
+    async def post(self, request, session_id):
         """
         Resume an existing Claude session and return SSE stream.
         """
-        from django.http import JsonResponse
+        from django.http import JsonResponse, StreamingHttpResponse
+        from asgiref.sync import sync_to_async
+        import asyncio
 
         # Check authentication
-        if not request.user.is_authenticated:
+        @sync_to_async
+        def get_user(request):
+            return request.user if request.user.is_authenticated else None
+
+        user = await get_user(request)
+        if not user:
             return JsonResponse({'error': 'Authentication required'}, status=401)
 
-        session = get_object_or_404(Session, id=session_id)
+        # Get session
+        @sync_to_async
+        def get_session(session_id):
+            return Session.objects.select_related('user').get(id=session_id)
+
+        try:
+            session = await get_session(session_id)
+        except Session.DoesNotExist:
+            return JsonResponse({'error': 'Session not found'}, status=404)
 
         # Check ownership
-        if session.user != request.user:
+        if session.user != user:
             return JsonResponse({'error': 'Access denied'}, status=403)
 
         # Parse JSON body
@@ -472,12 +487,16 @@ class SessionResumeView(View):
 
         # Add user message if provided
         if message_content:
-            session.add_message('user', message_content, 'complete')
-            session.add_message('agent', '', 'streaming')
+            @sync_to_async
+            def add_messages():
+                session.add_message('user', message_content, 'complete')
+                session.add_message('agent', '', 'streaming')
 
-            create_audit_log(
+            await add_messages()
+
+            await sync_to_async(create_audit_log)(
                 event_type='MESSAGE_SENT',
-                user_id=request.user.id,
+                user_id=user.id,
                 session_id=session.id,
                 workspace_id=session.workspace_id,
                 message_role='user',
@@ -485,12 +504,11 @@ class SessionResumeView(View):
             )
 
         # Send resume via WebSocket
-        channel_layer = get_channel_layer()
         workspace_id = str(session.workspace_id)
 
         try:
-            async_to_sync(send_resume_to_workspace)(
-                channel_layer,
+            await send_resume_to_workspace(
+                get_channel_layer(),
                 workspace_id,
                 str(session_id),
                 history_session_id,
@@ -501,42 +519,56 @@ class SessionResumeView(View):
             logger.error(f'WebSocket resume failed: {e}')
             return JsonResponse({'error': 'Workspace client unavailable'}, status=503)
 
-        # Return SSE stream directly
+        # Return SSE stream using async generator with thread-based Redis polling
+        async def event_stream():
+            session_id_str = str(session_id)
+            r = get_redis_client()
+            pubsub = r.pubsub()
+            channel = f'session:{session_id_str}'
+            loop = asyncio.get_running_loop()
+
+            try:
+                # Subscribe in thread to avoid blocking
+                await loop.run_in_executor(None, pubsub.subscribe, channel)
+
+                # Send initial connection event
+                logger.info(f'[SSE] Sending connected event for session {session_id_str}')
+                yield f'data: {json.dumps({"type": "connected", "session_id": session_id_str})}\n\n'
+
+                # Poll for messages in thread to avoid blocking event loop
+                while True:
+                    message = await loop.run_in_executor(None, pubsub.get_message, True, 0.1)
+
+                    if message is None:
+                        await asyncio.sleep(0.05)
+                        continue
+
+                    if message['type'] == 'message':
+                        data = message['data']
+                        event = json.loads(data)
+                        event_type = event.get('type')
+
+                        logger.info(f'[SSE] Yielding event: type={event_type}, session={session_id_str}')
+                        yield f'data: {json.dumps(event)}\n\n'
+
+                        await asyncio.sleep(0)
+
+                        if event_type in ('done', 'error', 'interrupted'):
+                            logger.info(f'[SSE] Stream ended for session {session_id_str}')
+                            break
+
+            except GeneratorExit:
+                logger.info(f'SSE client disconnected for session {session_id_str}')
+            finally:
+                await loop.run_in_executor(None, pubsub.unsubscribe, channel)
+                await loop.run_in_executor(None, pubsub.close)
+                r.close()
+
         return StreamingHttpResponse(
-            self._event_stream(session_id),
+            event_stream(),
             content_type='text/event-stream',
             headers={
                 'Cache-Control': 'no-cache',
                 'X-Accel-Buffering': 'no',
             },
         )
-
-    def _event_stream(self, session_id: str):
-        """Generate SSE events from Redis pub/sub."""
-        session_id_str = str(session_id)
-        r = get_redis_client()
-        pubsub = r.pubsub()
-        channel = f'session:{session_id_str}'
-
-        try:
-            pubsub.subscribe(channel)
-            yield f'data: {json.dumps({"type": "connected", "session_id": session_id_str})}\n\n'
-
-            for message in pubsub.listen():
-                if message['type'] == 'message':
-                    data = message['data']
-                    event = json.loads(data)
-                    event_type = event.get('type')
-
-                    logger.info(f'[SSE] Yielding event: type={event_type}, session={session_id_str}')
-                    yield f'data: {json.dumps(event)}\n\n'
-
-                    if event_type in ('done', 'error', 'interrupted'):
-                        break
-
-        except GeneratorExit:
-            logger.info(f'SSE client disconnected for session {session_id_str}')
-        finally:
-            pubsub.unsubscribe(channel)
-            pubsub.close()
-            r.close()

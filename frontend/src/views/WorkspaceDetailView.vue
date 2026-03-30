@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, computed } from 'vue'
+import { onMounted, onUnmounted, ref, computed, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
 import { onFileOperation, offFileOperation } from '@/stores/session'
@@ -37,6 +37,7 @@ const isOffline = ref(false)
 const isComposing = ref(false) // IME composition state
 const currentHistorySessionId = ref<string | undefined>() // Track resumed session for sending new messages
 const textareaRef = ref<HTMLTextAreaElement | null>(null)
+const messagesRef = ref<HTMLDivElement | null>(null) // Reference to messages container for auto-scroll
 
 // File tree refresh trigger
 const fileRefreshTrigger = ref(0)
@@ -165,6 +166,7 @@ async function generatePreviewToken(): Promise<boolean> {
       // Domain: .preview.localhost allows workspace-id.preview.localhost to access
       const maxAge = Math.floor((data.expires_at_unix || 600))
       document.cookie = `preview_token=${data.token}; Path=/; Domain=.${previewDomain.value}; Max-Age=${maxAge}; SameSite=Lax`
+      console.log('[Preview] Cookie set:', `preview_token=${data.token}; Path=/; Domain=.${previewDomain.value}; Max-Age=${maxAge}; SameSite=Lax`)
 
       return true
     } else if (response.status === 403) {
@@ -243,6 +245,9 @@ async function fetchWorkspace() {
 
 async function sendMessage() {
   if (!newMessage.value.trim() || sessionStore.isStreaming) return
+
+  // Scroll to bottom before sending (user should see their new message)
+  scrollToBottom()
 
   const content = newMessage.value
   newMessage.value = ''
@@ -430,10 +435,48 @@ function adjustTextareaHeight() {
   textarea.style.height = newHeight + 'px'
 }
 
+// Scroll to bottom immediately (used when sending new message)
+function scrollToBottom() {
+  const container = messagesRef.value
+  if (!container) return
+  container.scrollTop = container.scrollHeight
+}
+
+// Smart scroll: only scroll to bottom if user is near the bottom
+function scrollToBottomIfNearBottom() {
+  const container = messagesRef.value
+  if (!container) return
+
+  // Check if user is near the bottom (within 100px threshold)
+  const threshold = 100
+  const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < threshold
+
+  if (isNearBottom) {
+    // Scroll to bottom
+    container.scrollTop = container.scrollHeight
+  }
+}
+
 function renderMarkdown(content: string): string {
   if (!content) return ''
   return marked.parse(content, { breaks: true }) as string
 }
+
+// Watch messages for changes and auto-scroll
+watch(
+  () => ({ length: sessionStore.messages.length, content: sessionStore.messages.map(m => m.content).join('') }),
+  (newVal, oldVal) => {
+    nextTick(() => {
+      // If new message added, force scroll to bottom
+      if (newVal.length > oldVal?.length) {
+        scrollToBottom()
+      } else {
+        // Otherwise only scroll if user is near bottom
+        scrollToBottomIfNearBottom()
+      }
+    })
+  }
+)
 </script>
 
 <template>
@@ -485,7 +528,7 @@ function renderMarkdown(content: string): string {
 
         <!-- Chat panel -->
         <div class="chat-panel">
-          <div class="messages">
+          <div class="messages" ref="messagesRef">
             <div
               v-for="(msg, idx) in sessionStore.messages"
               :key="idx"
