@@ -119,12 +119,16 @@ http {
         set $container_host "";
 
         # Handle OPTIONS preflight requests and set container_host
+        # Also set CORS headers for all responses (actual requests)
         access_by_lua_block {
-            -- Handle OPTIONS preflight requests
+            -- Set CORS headers for all responses (will be sent with the response)
+            ngx.header['Access-Control-Allow-Origin'] = '*'
+            ngx.header['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS'
+            ngx.header['Access-Control-Allow-Headers'] = '*'
+            ngx.header['Access-Control-Expose-Headers'] = '*'
+
+            -- Handle OPTIONS preflight requests - return early without proxying
             if ngx.req.get_method() == "OPTIONS" then
-                ngx.header['Access-Control-Allow-Origin'] = '*'
-                ngx.header['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
-                ngx.header['Access-Control-Allow-Headers'] = '*'
                 ngx.header['Access-Control-Max-Age'] = '86400'
                 ngx.header['Content-Length'] = 0
                 ngx.exit(204)
